@@ -2,6 +2,9 @@ import sys
 import subprocess
 import pandas as pd
 from datetime import datetime, timedelta
+from dateutil import parser as dateparser
+from datetime import timezone
+
 from pathlib import Path
 
 TIME_DELTA = timedelta(minutes=5)
@@ -41,12 +44,17 @@ def get_metadata_with_exiftool(file_path):
         return None
 
 def parse_datetime(dt_str):
-    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(dt_str, fmt)
-        except:
-            continue
-    return None
+    try:
+        dt_str = dt_str.strip()
+        if ":" in dt_str[:10]:  # Likely EXIF format
+            # Strip sub-seconds and timezone offset if present
+            dt_str = dt_str[:19]
+            return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+        return dateparser.parse(dt_str)
+    except Exception as e:
+        print(f"⚠️ Failed to parse datetime: {dt_str} ({e})", file=sys.stderr)
+        return None
+
 
 def compare_metadata(csv_meta, file_meta):
     print("🔍 Comparing metadata:")
@@ -60,6 +68,11 @@ def compare_metadata(csv_meta, file_meta):
 
     dt1 = parse_datetime(csv_meta["DateTime"])
     dt2 = parse_datetime(file_meta["DateTime"])
+
+    # If one is naive, strip timezone from both
+    if (dt1 and dt2) and (dt1.tzinfo is None or dt2.tzinfo is None):
+        dt1 = dt1.replace(tzinfo=None)
+        dt2 = dt2.replace(tzinfo=None)    
     print(f"DateTimeOriginal: CSV='{csv_meta['DateTime']}' vs File='{file_meta['DateTime']}'")
 
     if dt1 and dt2:

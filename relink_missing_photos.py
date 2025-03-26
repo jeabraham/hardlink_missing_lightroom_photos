@@ -2,42 +2,52 @@ import os
 import csv
 import argparse
 import sys
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from PIL import Image
-from PIL.ExifTags import TAGS
+from PIL import ExifTags
 import pandas as pd
 import random
+from dateutil import parser as dateparser
 
 # Constants
 SEARCH_ROOT = "/Volumes/Ladyhawke"
 TIME_DELTA = timedelta(minutes=5)
 
-def get_exif_data(image_path):
+def get_exif_data_exiftool(image_path):
     try:
-        image = Image.open(image_path)
-        exif_data = image._getexif() or {}
-        exif = {TAGS.get(tag): val for tag, val in exif_data.items() if tag in TAGS}
-
-        width, height = image.size
+        result = subprocess.run(
+            ["exiftool", "-Make", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", image_path],
+            capture_output=True, text=True, check=True
+        )
+        data = {}
+        for line in result.stdout.strip().splitlines():
+            if ':' not in line:
+                continue
+            key, val = line.split(':', 1)
+            data[key.strip()] = val.strip()
         return {
-            'Camera Make': exif.get('Make', ''),
-            'DateTime': exif.get('DateTimeOriginal', ''),
-            'Width': width,
-            'Height': height
+            "Camera Make": data.get("Make", ""),
+            "Width": int(data.get("Image Width", "0").replace(" pixels", "")),
+            "Height": int(data.get("Image Height", "0").replace(" pixels", "")),
+            "DateTime": data.get("Date/Time Original", "")
         }
-    except Exception as e:
-        print(f"Error reading EXIF from {image_path}: {e}", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error running exiftool on {image_path}: {e.stderr}", file=sys.stderr)
         return None
 
 def parse_datetime(dt_str):
     try:
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        try:
-            return datetime.fromisoformat(dt_str)
-        except Exception:
-            return None
+        dt_str = dt_str.strip()
+        if ":" in dt_str[:10]:  # Likely EXIF format
+            # Strip sub-seconds and timezone offset if present
+            dt_str = dt_str[:19]
+            return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+        return dateparser.parse(dt_str)
+    except Exception as e:
+        print(f"⚠️ Failed to parse datetime: {dt_str} ({e})", file=sys.stderr)
+        return None
+
 
 def index_files_by_stem(search_root):
     print(f"Indexing files under {search_root}...", file=sys.stderr)
@@ -66,6 +76,7 @@ def main(csv_filename, test_n=None):
     relink_commands = []
     ambiguous_matches = []
     still_missing = []
+    resolution_mismatches = []
 
     total = len(missing_photos_df)
     print(f"Processing {total} rows...\n", file=sys.stderr)
@@ -91,8 +102,10 @@ def main(csv_filename, test_n=None):
             continue
 
         good_matches = []
+        resolution_conflict = []
+
         for candidate in candidates:
-            metadata = get_exif_data(candidate)
+            metadata = get_exif_data_exiftool(candidate)
             if not metadata:
                 continue
 
@@ -100,16 +113,37 @@ def main(csv_filename, test_n=None):
             if not candidate_time:
                 continue
 
-            if (metadata['Camera Make'].strip().lower() == str(row['Camera Make']).strip().lower() and
-                metadata['Width'] == int(row['Width']) and
-                metadata['Height'] == int(row['Height']) and
-                abs(candidate_time - target_time) <= TIME_DELTA):
-                good_matches.append(candidate)
+            if (target_time.tzinfo is None or candidate_time.tzinfo is None):
+                target_time = target_time.replace(tzinfo=None)
+                candidate_time = candidate_time.replace(tzinfo=None)
+
+            time_matches = abs(candidate_time - target_time) <= TIME_DELTA
+
+            csv_camera = str(row['Camera Make']).strip().lower()
+            file_camera = metadata['Camera Make'].strip().lower()
+            camera_matches = csv_camera in file_camera or file_camera in csv_camera
+
+            if time_matches and camera_matches:
+                if metadata['Width'] == int(row['Width']) and metadata['Height'] == int(row['Height']):
+                    good_matches.append(candidate)
+                else:
+                    resolution_conflict.append((candidate, metadata))
 
         if len(good_matches) == 1:
             relink_commands.append(f'ln "{good_matches[0]}" "{original_path}"')
         elif len(good_matches) > 1:
             ambiguous_matches.append({"Missing": original_path, "Candidates": [str(m) for m in good_matches]})
+        elif resolution_conflict:
+            best = None
+            comments = []
+            for candidate, meta in resolution_conflict:
+                comment = f"# {candidate} ({meta['Width']}x{meta['Height']}, {meta['Camera Make']})"
+                comments.append(comment)
+                if meta['Width'] > int(row['Width']) and meta['Height'] > int(row['Height']) and Path(candidate).suffix == Path(original_path).suffix:
+                    best = candidate
+            if best:
+                resolution_mismatches.append(f'ln "{best}" "{original_path}"')
+            resolution_mismatches.extend(comments)
         else:
             still_missing.append(row)
 
@@ -127,14 +161,20 @@ def main(csv_filename, test_n=None):
         for item in ambiguous_matches:
             writer.writerow({"Missing": item["Missing"], "Candidates": "; ".join(item["Candidates"])})
 
+    with open("resolution_mismatch.sh", "w") as f:
+        f.write("#!/bin/bash\n")
+        for line in resolution_mismatches:
+            f.write(f"{line}\n")
+
     still_missing_df = pd.DataFrame(still_missing)
     still_missing_df.to_csv("Still_Missing_Photos.csv", index=False)
 
     print("\nSummary:", file=sys.stderr)
     print(f"  Relink commands generated: {len(relink_commands)}", file=sys.stderr)
     print(f"  Ambiguous matches: {len(ambiguous_matches)}", file=sys.stderr)
+    print(f"  Resolution mismatches: {len(resolution_mismatches)}", file=sys.stderr)
     print(f"  Still missing: {len(still_missing)}", file=sys.stderr)
-    print("\nDone. Outputs: relink_good_matches.sh, ambiguous_matches.csv, Still_Missing_Photos.csv")
+    print("\nDone. Outputs: relink_good_matches.sh, ambiguous_matches.csv, resolution_mismatch.sh, Still_Missing_Photos.csv")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and relink missing photos by matching metadata.")
