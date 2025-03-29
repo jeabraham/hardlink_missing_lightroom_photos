@@ -11,8 +11,8 @@ import random
 from dateutil import parser as dateparser
 
 # Constants
-SEARCH_ROOT = "/Volumes/Ladyhawke"
 TIME_DELTA = timedelta(minutes=5)
+RAW_EXTENSIONS = {".dng", ".orf", ".arw", ".cr2", ".nef", ".rw2", ".raf", ".pef"}
 
 def get_exif_data_exiftool(image_path):
     try:
@@ -39,8 +39,7 @@ def get_exif_data_exiftool(image_path):
 def parse_datetime(dt_str):
     try:
         dt_str = dt_str.strip()
-        if ":" in dt_str[:10]:  # Likely EXIF format
-            # Strip sub-seconds and timezone offset if present
+        if ":" in dt_str[:10]:
             dt_str = dt_str[:19]
             return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
         return dateparser.parse(dt_str)
@@ -48,11 +47,12 @@ def parse_datetime(dt_str):
         print(f"⚠️ Failed to parse datetime: {dt_str} ({e})", file=sys.stderr)
         return None
 
-
-def index_files_by_stem(search_root):
+def index_files_by_stem(search_root, exclude_sources):
     print(f"Indexing files under {search_root}...", file=sys.stderr)
     index = {}
     for root, _, files in os.walk(search_root):
+        if any(excl in root for excl in exclude_sources):
+            continue
         for file in files:
             stem = Path(file).stem
             full_path = Path(root) / file
@@ -60,7 +60,10 @@ def index_files_by_stem(search_root):
     print(f"Indexed {sum(len(v) for v in index.values())} files.\n", file=sys.stderr)
     return index
 
-def main(csv_filename, test_n=None):
+def is_raw_file(path):
+    return Path(path).suffix.lower() in RAW_EXTENSIONS
+
+def main(csv_filename, test_n=None, exclude_sources=None, exclude_targets=None):
     try:
         missing_photos_df = pd.read_csv(csv_filename)
     except Exception as e:
@@ -71,7 +74,7 @@ def main(csv_filename, test_n=None):
         print(f"Running test mode with {test_n} random entries...", file=sys.stderr)
         missing_photos_df = missing_photos_df.sample(n=test_n, random_state=42)
 
-    file_index = index_files_by_stem(SEARCH_ROOT)
+    file_index = index_files_by_stem("/Volumes/Ladyhawke", exclude_sources or [])
 
     relink_commands = []
     ambiguous_matches = []
@@ -83,6 +86,9 @@ def main(csv_filename, test_n=None):
 
     for i, (_, row) in enumerate(missing_photos_df.iterrows(), 1):
         original_path = row['Photo']
+        if exclude_targets and any(excl in original_path for excl in exclude_targets):
+            continue
+
         filename = Path(original_path).name
         stem = Path(filename).stem.lower()
 
@@ -92,7 +98,7 @@ def main(csv_filename, test_n=None):
             still_missing.append(row)
             continue
 
-        if pd.isna(row.get("Date/Time Original (Capture)")) or pd.isna(row.get("Camera Make")) or pd.isna(row.get("Width")) or pd.isna(row.get("Height")):
+        if pd.isna(row.get("Date/Time Original (Capture)")) or pd.isna(row.get("Width")) or pd.isna(row.get("Height")):
             still_missing.append(row)
             continue
 
@@ -101,49 +107,55 @@ def main(csv_filename, test_n=None):
             still_missing.append(row)
             continue
 
-        good_matches = []
-        resolution_conflict = []
+        csv_camera = str(row.get('Camera Make') or '').strip().lower()
 
-        for candidate in candidates:
-            metadata = get_exif_data_exiftool(candidate)
-            if not metadata:
-                continue
+        def score(candidate):
+            meta = get_exif_data_exiftool(candidate)
+            if not meta:
+                return None
+            cand_time = parse_datetime(meta['DateTime'])
+            if not cand_time:
+                return None
+            if (target_time.tzinfo is None or cand_time.tzinfo is None):
+                target_time_naive = target_time.replace(tzinfo=None)
+                cand_time_naive = cand_time.replace(tzinfo=None)
+            else:
+                target_time_naive = target_time
+                cand_time_naive = cand_time
+            if abs(cand_time_naive - target_time_naive) > TIME_DELTA:
+                return None
+            file_camera = meta['Camera Make'].strip().lower()
+            camera_ok = not csv_camera or not file_camera or csv_camera in file_camera or file_camera in csv_camera
+            if not camera_ok:
+                return None
+            return {
+                'path': candidate,
+                'meta': meta,
+                'raw': is_raw_file(candidate),
+                'camera_score': 2 if csv_camera and file_camera and csv_camera == file_camera else 1 if csv_camera in file_camera or file_camera in csv_camera else 0,
+                'resolution': meta['Width'] * meta['Height']
+            }
 
-            candidate_time = parse_datetime(metadata['DateTime'])
-            if not candidate_time:
-                continue
+        scored = list(filter(None, (score(c) for c in candidates)))
 
-            if (target_time.tzinfo is None or candidate_time.tzinfo is None):
-                target_time = target_time.replace(tzinfo=None)
-                candidate_time = candidate_time.replace(tzinfo=None)
+        exact_matches = [s for s in scored if s['meta']['Width'] == int(row['Width']) and s['meta']['Height'] == int(row['Height'])]
 
-            time_matches = abs(candidate_time - target_time) <= TIME_DELTA
-
-            csv_camera = str(row['Camera Make']).strip().lower()
-            file_camera = metadata['Camera Make'].strip().lower()
-            camera_matches = csv_camera in file_camera or file_camera in csv_camera
-
-            if time_matches and camera_matches:
-                if metadata['Width'] == int(row['Width']) and metadata['Height'] == int(row['Height']):
-                    good_matches.append(candidate)
-                else:
-                    resolution_conflict.append((candidate, metadata))
-
-        if len(good_matches) == 1:
-            relink_commands.append(f'ln "{good_matches[0]}" "{original_path}"')
-        elif len(good_matches) > 1:
-            ambiguous_matches.append({"Missing": original_path, "Candidates": [str(m) for m in good_matches]})
-        elif resolution_conflict:
-            best = None
-            comments = []
-            for candidate, meta in resolution_conflict:
-                comment = f"# {candidate} ({meta['Width']}x{meta['Height']}, {meta['Camera Make']})"
-                comments.append(comment)
-                if meta['Width'] > int(row['Width']) and meta['Height'] > int(row['Height']) and Path(candidate).suffix == Path(original_path).suffix:
-                    best = candidate
-            if best:
-                resolution_mismatches.append(f'ln "{best}" "{original_path}"')
-            resolution_mismatches.extend(comments)
+        if len(exact_matches) == 1:
+            relink_commands.append(f'ln "{exact_matches[0]["path"]}" "{original_path}"')
+        elif len(exact_matches) > 1:
+            sorted_matches = sorted(exact_matches, key=lambda x: (-x['raw'], -x['camera_score'], -x['resolution']))
+            best = sorted_matches[0]
+            relink_commands.append(f'# Selected best match from {len(sorted_matches)} candidates')
+            relink_commands.append(f'ln "{best["path"]}" "{original_path}"')
+            for alt in sorted_matches[1:]:
+                relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+        elif scored:
+            resolution_sorted = sorted(scored, key=lambda x: (-x['raw'], -x['camera_score'], -x['resolution']))
+            best = resolution_sorted[0]
+            resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
+            resolution_mismatches.append(f'ln "{best["path"]}" "{original_path}"')
+            for alt in resolution_sorted[1:]:
+                resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
         else:
             still_missing.append(row)
 
@@ -155,12 +167,6 @@ def main(csv_filename, test_n=None):
         for cmd in relink_commands:
             f.write(cmd + "\n")
 
-    with open("ambiguous_matches.csv", "w", newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=["Missing", "Candidates"])
-        writer.writeheader()
-        for item in ambiguous_matches:
-            writer.writerow({"Missing": item["Missing"], "Candidates": "; ".join(item["Candidates"])})
-
     with open("resolution_mismatch.sh", "w") as f:
         f.write("#!/bin/bash\n")
         for line in resolution_mismatches:
@@ -171,14 +177,15 @@ def main(csv_filename, test_n=None):
 
     print("\nSummary:", file=sys.stderr)
     print(f"  Relink commands generated: {len(relink_commands)}", file=sys.stderr)
-    print(f"  Ambiguous matches: {len(ambiguous_matches)}", file=sys.stderr)
     print(f"  Resolution mismatches: {len(resolution_mismatches)}", file=sys.stderr)
     print(f"  Still missing: {len(still_missing)}", file=sys.stderr)
-    print("\nDone. Outputs: relink_good_matches.sh, ambiguous_matches.csv, resolution_mismatch.sh, Still_Missing_Photos.csv")
+    print("\nDone. Outputs: relink_good_matches.sh, resolution_mismatch.sh, Still_Missing_Photos.csv")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and relink missing photos by matching metadata.")
     parser.add_argument("csv_filename", help="Path to the CSV file containing missing photos metadata.")
     parser.add_argument("--test-n", type=int, help="Run script on a random sample of N rows for testing.")
+    parser.add_argument("--exclude-sources", nargs='*', help="Paths to exclude as candidate sources.")
+    parser.add_argument("--exclude-targets", nargs='*', help="Paths to exclude from processing as missing targets.")
     args = parser.parse_args()
-    main(args.csv_filename, args.test_n)
+    main(args.csv_filename, args.test_n, args.exclude_sources, args.exclude_targets)
