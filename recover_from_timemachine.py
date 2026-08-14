@@ -20,8 +20,12 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
+from itertools import groupby
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -53,26 +57,129 @@ STATUS_OTHER = "NON_LADYHAWKE_PATH"
 # Time Machine discovery
 # ---------------------------------------------------------------------------
 
+# Regex to extract the datetime portion from an APFS TM snapshot name.
+# e.g. "com.apple.TimeMachine.2022-11-10-152833.backup" → "2022-11-10-152833"
+_APFS_SNAP_DATE_RE = re.compile(
+    r"com\.apple\.TimeMachine\.(\d{4}-\d{2}-\d{2}-\d{6})\.backup"
+)
+
+
+def _list_apfs_snapshots(tm_volume: Path) -> list[dict]:
+    """
+    Run ``diskutil apfs listsnapshots <volume>`` and parse the output.
+
+    Returns a list of dicts with keys:
+      uuid  — snapshot UUID
+      name  — full snapshot name (e.g. "com.apple.TimeMachine.2022-11-10-152833.backup")
+      date  — extracted date string (e.g. "2022-11-10-152833"), or the full name if
+              the pattern doesn't match
+    Ordered as reported by diskutil (oldest-first in practice).
+    """
+    try:
+        proc = subprocess.run(
+            ["diskutil", "apfs", "listsnapshots", str(tm_volume)],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []  # diskutil not available (non-macOS)
+
+    snapshots = []
+    current_uuid = None
+    current_name = None
+
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        # UUID line: "+-- 3838ACCC-AC78-4A75-8126-27BC2768186F"
+        uuid_m = re.match(r"\+--\s+([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})", line)
+        if uuid_m:
+            current_uuid = uuid_m.group(1)
+            current_name = None
+            continue
+        # Name line: "|   Name:        com.apple.TimeMachine.2022-11-10-152833.backup"
+        name_m = re.search(r"Name:\s+(.+)", line)
+        if name_m and current_uuid:
+            current_name = name_m.group(1).strip()
+            date_m = _APFS_SNAP_DATE_RE.search(current_name)
+            date = date_m.group(1) if date_m else current_name
+            snapshots.append({"uuid": current_uuid, "name": current_name, "date": date})
+            current_uuid = None
+            current_name = None
+
+    return snapshots
+
+
+@contextmanager
+def _mount_apfs_snapshot(snapshot_name: str, tm_volume: Path):
+    """
+    Context manager that mounts an APFS snapshot read-only under a temporary
+    directory, yields the mount path, then unmounts when done.
+
+    Uses ``mount_apfs -s <snapshot_name> <volume> <mountpoint>``.
+    Requires root (or the caller to have appropriate privileges).
+    """
+    with tempfile.TemporaryDirectory(prefix="tm_snap_") as mountpoint:
+        try:
+            subprocess.run(
+                ["mount_apfs", "-s", snapshot_name, str(tm_volume), mountpoint],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise OSError(
+                f"mount_apfs failed for snapshot {snapshot_name!r}: "
+                f"{exc.stderr.decode(errors='replace').strip()}"
+            ) from exc
+        try:
+            yield Path(mountpoint)
+        finally:
+            subprocess.run(
+                ["umount", mountpoint],
+                capture_output=True,
+            )
+
+
 def discover_tm_layout(tm_volume: Path) -> dict:
     """
     Inspect a mounted Time Machine volume and return a dict describing its
-    layout.  Handles both the modern macOS layout (Backups.backupdb/<host>/)
-    and older HFS+ layout variants.
+    layout.  Handles three cases:
+
+      * ``apfs``   — APFS volume with Time Machine snapshots (macOS 10.14+).
+                     Snapshots are enumerated via ``diskutil apfs listsnapshots``.
+                     They must be individually mounted to browse their content.
+      * ``modern`` — HFS+ Backups.backupdb/<host>/<snapshot-dir>/ layout.
+      * ``unknown``— Neither structure found.
 
     Returns a dict with:
-      layout_type: "modern" | "unknown"
-      hosts: [str, ...]            — subdirectory names under Backups.backupdb
-      snapshots: {host: [Path]}    — sorted list of snapshot dirs per host
-      ladyhawke_roots: [Path]      — candidate dirs that look like Ladyhawke
+      layout_type:      "apfs" | "modern" | "unknown"
+      apfs_snapshots:   [{"uuid": …, "name": …, "date": …}]  (apfs only)
+      hosts:            [str, …]            (modern only)
+      snapshots:        {host: [Path]}      (modern only)
+      ladyhawke_roots:  [Path]              (modern only; one per host)
+      raw_notes:        [str, …]
     """
     result = {
         "layout_type": "unknown",
+        "apfs_snapshots": [],
         "hosts": [],
         "snapshots": {},
         "ladyhawke_roots": [],
         "raw_notes": [],
     }
 
+    # --- Try APFS snapshot layout first ---
+    apfs_snaps = _list_apfs_snapshots(tm_volume)
+    tm_snaps = [s for s in apfs_snaps if "TimeMachine" in s["name"]]
+    if tm_snaps:
+        result["layout_type"] = "apfs"
+        result["apfs_snapshots"] = tm_snaps
+        result["raw_notes"].append(
+            f"APFS volume: {len(tm_snaps)} Time Machine snapshots found "
+            f"(out of {len(apfs_snaps)} total APFS snapshots)."
+        )
+        return result
+
+    # --- Fall back to classic Backups.backupdb layout ---
     backupdb = tm_volume / "Backups.backupdb"
     if backupdb.is_dir():
         result["layout_type"] = "modern"
@@ -101,8 +208,6 @@ def discover_tm_layout(tm_volume: Path) -> dict:
             result["snapshots"][host] = snap_dirs
 
             # Look for Ladyhawke-related volume dirs inside each snapshot.
-            # Time Machine stores backed-up volumes as subdirectories of each
-            # snapshot directory named after the volume (e.g. "Ladyhawke").
             for snap_dir in snap_dirs:
                 candidate = snap_dir / "Ladyhawke"
                 if candidate.is_dir():
@@ -129,16 +234,31 @@ def discover_tm_layout(tm_volume: Path) -> dict:
 
 def all_ladyhawke_snapshots(layout: dict) -> list:
     """
-    Return a list of (snapshot_path, date_str) tuples, newest-first, for every
-    snapshot that contains a Ladyhawke volume directory.
+    Return a list of ``(snapshot_ref, date_str)`` tuples, newest-first, for
+    every snapshot that (for modern layout) contains a Ladyhawke volume
+    directory, or (for APFS layout) every Time Machine snapshot on the volume.
+
+    For ``modern`` layout the snapshot_ref is a ``Path`` (the Ladyhawke root
+    inside the snapshot directory).
+
+    For ``apfs`` layout the snapshot_ref is the snapshot **name** string
+    (e.g. ``"com.apple.TimeMachine.2022-11-10-152833.backup"``).  Files cannot
+    be browsed directly — callers must mount the snapshot to access content.
     """
+    if layout.get("layout_type") == "apfs":
+        # APFS snapshots from diskutil are typically oldest-first; reverse for newest-first.
+        snaps = layout.get("apfs_snapshots", [])
+        results = [(s["name"], s["date"]) for s in snaps]
+        results.sort(key=lambda t: t[1], reverse=True)
+        return results
+
+    # modern / unknown — original path-based approach
     results = []
     for host, snap_dirs in layout.get("snapshots", {}).items():
         for snap_dir in snap_dirs:
             lh = snap_dir / "Ladyhawke"
             if lh.is_dir():
-                results.append((lh, snap_dir.name))  # snap_dir.name is the date string
-    # Sort newest first (date strings are lexicographically sortable).
+                results.append((lh, snap_dir.name))
     results.sort(key=lambda t: t[1], reverse=True)
     return results
 
@@ -285,6 +405,88 @@ def file_stat(path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# APFS snapshot backup-path encoding
+# ---------------------------------------------------------------------------
+
+# Backup paths for APFS snapshots use a URI-like scheme so the restore command
+# can re-mount the correct snapshot.
+# Format:  apfs-snap://<tm_volume>::<snapshot_name>::<rel_path>
+# Example: apfs-snap:///Volumes/iMacBackup3::com.apple.TimeMachine.2022-11-10-152833.backup::RawPhotos/2013/foo.NEF
+APFS_SNAP_PREFIX = "apfs-snap://"
+
+
+def _apfs_backup_path(tm_volume: Path, snap_name: str, rel_path: str) -> str:
+    return f"{APFS_SNAP_PREFIX}{tm_volume}::{snap_name}::{rel_path}"
+
+
+def _parse_apfs_backup_path(backup_path: str):
+    """
+    Parse an APFS backup path URI.
+    Returns (tm_volume, snap_name, rel_path) or raises ValueError.
+    """
+    if not backup_path.startswith(APFS_SNAP_PREFIX):
+        raise ValueError(f"Not an APFS backup path: {backup_path!r}")
+    rest = backup_path[len(APFS_SNAP_PREFIX):]
+    parts = rest.split("::", 2)
+    if len(parts) != 3:
+        raise ValueError(f"Malformed APFS backup path: {backup_path!r}")
+    return Path(parts[0]), parts[1], parts[2]
+
+
+def is_apfs_backup_path(backup_path: str) -> bool:
+    return backup_path.startswith(APFS_SNAP_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# APFS-specific snapshot scanning (mount each snapshot once, check all files)
+# ---------------------------------------------------------------------------
+
+def scan_apfs_snapshots(
+    rel_paths: list[str],
+    snapshots: list,
+    tm_volume: Path,
+    *,
+    progress_callback=None,
+) -> dict:
+    """
+    For APFS Time Machine volumes, mount each snapshot once, check every
+    ``rel_path`` in the mounted Ladyhawke directory, then unmount.
+
+    ``snapshots`` is a list of ``(snap_name, date_str)`` tuples, newest-first
+    (as returned by ``all_ladyhawke_snapshots`` for the APFS layout).
+
+    Returns a dict mapping ``rel_path`` → list of
+    ``(apfs_backup_path_str, date_str, file_size, mtime)`` tuples, newest-first.
+    """
+    results = {r: [] for r in rel_paths}
+
+    for i, (snap_name, date_str) in enumerate(snapshots, 1):
+        if progress_callback:
+            progress_callback(i, len(snapshots), snap_name)
+
+        try:
+            with _mount_apfs_snapshot(snap_name, tm_volume) as mountpoint:
+                lh_root = mountpoint / "Ladyhawke"
+                for rel in rel_paths:
+                    candidate = lh_root / rel
+                    if candidate.is_file():
+                        stat = file_stat(candidate)
+                        results[rel].append((
+                            _apfs_backup_path(tm_volume, snap_name, rel),
+                            date_str,
+                            stat["file_size"],
+                            stat["mtime"],
+                        ))
+        except OSError as exc:
+            print(
+                f"  WARNING: skipping snapshot {snap_name}: {exc}",
+                file=sys.stderr,
+            )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # inspect command
 # ---------------------------------------------------------------------------
 
@@ -299,10 +501,35 @@ def cmd_inspect(args):
     layout = discover_tm_layout(tm_volume)
 
     print(f"Layout type : {layout['layout_type']}")
-    print(f"Hosts found : {layout['hosts'] or ['(none)']}")
 
     for note in layout["raw_notes"]:
         print(f"Note        : {note}")
+
+    if layout["layout_type"] == "apfs":
+        snaps = layout.get("apfs_snapshots", [])
+        print(f"\nAPFS Time Machine snapshots: {len(snaps)} total")
+        if snaps:
+            # Show a few oldest and newest; snapshots are newest-first after sorting
+            sorted_snaps = sorted(snaps, key=lambda s: s["date"], reverse=True)
+            display = sorted_snaps[:3]
+            tail = sorted_snaps[-3:] if len(sorted_snaps) > 6 else []
+            for s in display:
+                print(f"  {s['date']}  {s['name']}")
+            if len(sorted_snaps) > 6:
+                print(f"  ... ({len(sorted_snaps) - 6} more) ...")
+            for s in tail:
+                if s not in display:
+                    print(f"  {s['date']}  {s['name']}")
+            print(f"\n  Newest: {sorted_snaps[0]['date']}")
+            print(f"  Oldest: {sorted_snaps[-1]['date']}")
+        print(
+            "\nNote: APFS snapshots must be individually mounted to access their content."
+            "\nThe 'scan' command will mount each snapshot automatically (requires root)."
+        )
+        return
+
+    # modern / unknown layout
+    print(f"Hosts found : {layout['hosts'] or ['(none)']}")
 
     for host, snap_dirs in layout.get("snapshots", {}).items():
         print(f"\nHost: {host}")
@@ -357,30 +584,63 @@ def cmd_scan(args):
 
     print(f"Discovering Time Machine layout on {tm_volume}...", file=sys.stderr)
     layout = discover_tm_layout(tm_volume)
+    is_apfs = layout["layout_type"] == "apfs"
     snapshots = all_ladyhawke_snapshots(layout)
-    print(f"  {len(snapshots)} snapshots containing Ladyhawke found.", file=sys.stderr)
+    print(f"  Layout type: {layout['layout_type']}", file=sys.stderr)
+    print(f"  {len(snapshots)} Time Machine snapshots found.", file=sys.stderr)
     if not snapshots:
         print(
-            "WARNING: No Ladyhawke snapshots found. "
+            "WARNING: No Time Machine snapshots found. "
             "Every record will be classified NOT_FOUND_IN_TIME_MACHINE.",
             file=sys.stderr,
         )
 
     search_mode = args.search_mode
     month_interval = args.month_interval
-    month_anchor_indices = []
-    if search_mode == "anchored":
-        if month_interval < 1:
-            print("ERROR: --month-interval must be >= 1", file=sys.stderr)
-            sys.exit(1)
-        month_anchor_indices = build_month_anchor_indices(snapshots)
-        print(
-            "  Anchored mode: "
-            f"{len(month_anchor_indices)} monthly anchors, interval={month_interval}.",
-            file=sys.stderr,
-        )
+
+    if is_apfs:
+        # For APFS, each snapshot must be individually mounted.  We scan all
+        # snapshots (mounting each one once) and check every rel_path per mount.
+        # The anchored/full distinction only affects classic layouts; for APFS
+        # we always perform a full scan but apply the monthly-anchor filter if
+        # anchored mode is requested (to reduce the number of mounts).
+        if search_mode == "anchored":
+            if month_interval < 1:
+                print("ERROR: --month-interval must be >= 1", file=sys.stderr)
+                sys.exit(1)
+            anchor_indices = build_month_anchor_indices(snapshots)
+            probe_indices = set(anchor_indices[::month_interval])
+            snapshots_to_scan = [
+                snapshots[i] for i in sorted(probe_indices)
+            ]
+            # Re-sort newest-first after filtering
+            snapshots_to_scan.sort(key=lambda t: t[1], reverse=True)
+            print(
+                f"  APFS anchored mode: probing {len(snapshots_to_scan)} monthly "
+                f"anchor snapshots (interval={month_interval}).",
+                file=sys.stderr,
+            )
+        else:
+            snapshots_to_scan = snapshots
+            print(
+                f"  APFS full mode: will mount all {len(snapshots_to_scan)} snapshots.",
+                file=sys.stderr,
+            )
     else:
-        print("  Full mode: scanning all snapshots for each file.", file=sys.stderr)
+        snapshots_to_scan = snapshots
+        month_anchor_indices = []
+        if search_mode == "anchored":
+            if month_interval < 1:
+                print("ERROR: --month-interval must be >= 1", file=sys.stderr)
+                sys.exit(1)
+            month_anchor_indices = build_month_anchor_indices(snapshots)
+            print(
+                "  Anchored mode: "
+                f"{len(month_anchor_indices)} monthly anchors, interval={month_interval}.",
+                file=sys.stderr,
+            )
+        else:
+            print("  Full mode: scanning all snapshots for each file.", file=sys.stderr)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -395,6 +655,135 @@ def cmd_scan(args):
         "other": 0,
     }
 
+    # -----------------------------------------------------------------------
+    # APFS path: classify all files first, then do a single multi-file scan
+    # across all snapshots (each snapshot mounted once).
+    # -----------------------------------------------------------------------
+    if is_apfs:
+        # First pass: classify each record and collect rel_paths needing TM search.
+        classified = []  # list of (row, expected_path, rel, classification)
+        rel_paths_needing_search = []
+
+        for row in missing:
+            expected_path = row.get("Photo", "").strip()
+            counters["total"] += 1
+            rel = relative_ladyhawke_path(expected_path)
+            if rel is None:
+                classified.append((row, expected_path, None, "other"))
+                counters["other"] += 1
+            elif Path(expected_path).exists():
+                classified.append((row, expected_path, rel, "present"))
+                counters["present"] += 1
+                counters["ladyhawke"] += 1
+            else:
+                classified.append((row, expected_path, rel, "search"))
+                counters["ladyhawke"] += 1
+                rel_paths_needing_search.append(rel)
+
+        # Deduplicate rel_paths for the scan (there may be duplicates in the CSV).
+        unique_rels = list(dict.fromkeys(rel_paths_needing_search))
+
+        def _progress(i, total, snap_name):
+            if i % 10 == 0 or i == total:
+                print(
+                    f"  Mounting snapshot {i}/{total}: {snap_name}",
+                    file=sys.stderr,
+                )
+
+        if unique_rels and snapshots_to_scan:
+            print(
+                f"  Scanning {len(unique_rels)} unique paths across "
+                f"{len(snapshots_to_scan)} snapshots...",
+                file=sys.stderr,
+            )
+            apfs_results = scan_apfs_snapshots(
+                unique_rels,
+                snapshots_to_scan,
+                tm_volume,
+                progress_callback=_progress,
+            )
+        else:
+            apfs_results = {r: [] for r in unique_rels}
+
+        # Second pass: write the CSV.
+        with open(output_path, "w", newline="", encoding="utf-8") as out_fh:
+            writer = csv.DictWriter(out_fh, fieldnames=REPORT_COLUMNS)
+            writer.writeheader()
+
+            for row, expected_path, rel, classification in classified:
+                if classification == "other":
+                    writer.writerow(
+                        {
+                            "status": STATUS_OTHER,
+                            "expected_path": expected_path,
+                            "relative_path": "",
+                            "backup_path": "",
+                            "backup_date": "",
+                            "file_size": "",
+                            "mtime": "",
+                            "notes": "Expected path is not under /Volumes/Ladyhawke",
+                        }
+                    )
+                elif classification == "present":
+                    writer.writerow(
+                        {
+                            "status": STATUS_PRESENT,
+                            "expected_path": expected_path,
+                            "relative_path": rel,
+                            "backup_path": "",
+                            "backup_date": "",
+                            "file_size": "",
+                            "mtime": "",
+                            "notes": "File already exists at expected path",
+                        }
+                    )
+                else:
+                    matches = apfs_results.get(rel, [])
+                    if not matches:
+                        counters["not_found"] += 1
+                        writer.writerow(
+                            {
+                                "status": STATUS_NOT_FOUND,
+                                "expected_path": expected_path,
+                                "relative_path": rel,
+                                "backup_path": "",
+                                "backup_date": "",
+                                "file_size": "",
+                                "mtime": "",
+                                "notes": "",
+                            }
+                        )
+                    else:
+                        best_bp, best_date, best_size, best_mtime = matches[0]
+                        if len(matches) == 1:
+                            counters["found"] += 1
+                            status = STATUS_FOUND
+                            notes = ""
+                        else:
+                            counters["multiple"] += 1
+                            status = STATUS_MULTIPLE
+                            other_dates = ", ".join(d for _, d, _, _ in matches[1:])
+                            notes = f"Also found in: {other_dates}"
+                        writer.writerow(
+                            {
+                                "status": status,
+                                "expected_path": expected_path,
+                                "relative_path": rel,
+                                "backup_path": best_bp,
+                                "backup_date": best_date,
+                                "file_size": best_size,
+                                "mtime": best_mtime,
+                                "notes": notes,
+                            }
+                        )
+
+        print(f"\nReport written to {output_path}\n")
+        _print_summary(counters)
+        return
+
+    # -----------------------------------------------------------------------
+    # Classic (modern/HFS+) path: per-file search across pre-mounted snapshots.
+    # -----------------------------------------------------------------------
     with open(output_path, "w", newline="", encoding="utf-8") as out_fh:
         writer = csv.DictWriter(out_fh, fieldnames=REPORT_COLUMNS)
         writer.writeheader()
@@ -447,12 +836,12 @@ def cmd_scan(args):
             if search_mode == "anchored":
                 matches = find_in_snapshots_anchored(
                     rel,
-                    snapshots,
+                    snapshots_to_scan,
                     month_anchor_indices=month_anchor_indices,
                     month_interval=month_interval,
                 )
             else:
-                matches = find_in_snapshots(rel, snapshots)
+                matches = find_in_snapshots(rel, snapshots_to_scan)
 
             if not matches:
                 counters["not_found"] += 1
@@ -578,23 +967,20 @@ def cmd_restore(args):
     copied = 0
     errors = 0
 
-    for row in eligible:
-        expected = row["expected_path"]
-        backup = row["backup_path"]
-        date = row.get("backup_date", "")
+    # Group APFS rows by snapshot name to minimise the number of mounts.
+    apfs_rows = [r for r in eligible if is_apfs_backup_path(r.get("backup_path", ""))]
+    classic_rows = [r for r in eligible if not is_apfs_backup_path(r.get("backup_path", ""))]
 
-        src = Path(backup)
-        dst = Path(expected)
-
-        # Safety checks
+    def _restore_file(src: Path, dst: Path, backup: str, expected: str, date: str):
+        nonlocal copied, errors
         if not src.exists():
             log("COPY", "ERROR", backup, expected, notes="Source no longer exists")
             errors += 1
-            continue
+            return
         if not src.is_file():
             log("COPY", "ERROR", backup, expected, notes="Source is not a regular file")
             errors += 1
-            continue
+            return
         if dst.exists():
             log(
                 "COPY",
@@ -603,7 +989,7 @@ def cmd_restore(args):
                 expected,
                 notes="Destination already exists; will not overwrite",
             )
-            continue
+            return
 
         sha = ""
         if args.verify_hash:
@@ -642,6 +1028,59 @@ def cmd_restore(args):
                 copied += 1
             except Exception as exc:
                 log("COPY", "ERROR", backup, expected, notes=str(exc))
+                errors += 1
+
+    # --- Classic (HFS+) rows: source paths are plain filesystem paths ---
+    for row in classic_rows:
+        expected = row["expected_path"]
+        backup = row["backup_path"]
+        date = row.get("backup_date", "")
+        _restore_file(Path(backup), Path(expected), backup, expected, date)
+
+    # --- APFS rows: group by (tm_volume, snap_name) to mount each snapshot once ---
+    def _apfs_sort_key(row):
+        bp = row.get("backup_path", "")
+        try:
+            tm_vol, snap_name, _ = _parse_apfs_backup_path(bp)
+            return (str(tm_vol), snap_name)
+        except ValueError:
+            return ("", "")
+
+    apfs_rows_sorted = sorted(apfs_rows, key=_apfs_sort_key)
+    for (tm_vol_str, snap_name), group_rows in groupby(apfs_rows_sorted, key=_apfs_sort_key):
+        group_list = list(group_rows)
+        if not snap_name:
+            for row in group_list:
+                log("COPY", "ERROR", row["backup_path"], row["expected_path"],
+                    notes="Malformed APFS backup path")
+                errors += 1
+            continue
+
+        tm_vol = Path(tm_vol_str)
+        print(
+            f"  Mounting APFS snapshot {snap_name} "
+            f"({len(group_list)} file(s))...",
+            file=sys.stderr,
+        )
+        try:
+            with _mount_apfs_snapshot(snap_name, tm_vol) as mountpoint:
+                for row in group_list:
+                    backup = row["backup_path"]
+                    expected = row["expected_path"]
+                    date = row.get("backup_date", "")
+                    try:
+                        _, _, rel = _parse_apfs_backup_path(backup)
+                    except ValueError:
+                        log("COPY", "ERROR", backup, expected,
+                            notes="Malformed APFS backup path")
+                        errors += 1
+                        continue
+                    src = mountpoint / "Ladyhawke" / rel
+                    _restore_file(src, Path(expected), backup, expected, date)
+        except OSError as exc:
+            for row in group_list:
+                log("COPY", "ERROR", row["backup_path"], row["expected_path"],
+                    notes=f"Could not mount snapshot: {exc}")
                 errors += 1
 
     # Write log
