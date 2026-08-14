@@ -1,335 +1,66 @@
-# Lightroom Missing Photo Recovery Plan
+# Lightroom Missing Photo Recovery
 
-## Objective
+Tools for recovering Lightroom Classic photos whose originals are reported as missing,
+while preserving catalog records, edits, collections, and cloud relationships.
 
-Recover Lightroom Classic photos whose originals are reported as missing, while preserving Lightroom's existing catalog records, edits, collections, and cloud relationships wherever possible.
+The guiding principle is: **restore or hardlink a valid file to the exact pathname
+Lightroom already expects** — rather than importing a replacement as a new photo.
 
-The guiding principle is:
+See [DESIGN.md](DESIGN.md) for the full rationale, background, and planned future phases.
 
-**Restore or hardlink a valid file into the exact pathname Lightroom already expects, rather than importing a replacement as a new photo or manipulating Lightroom's catalog unnecessarily.**
+---
 
-The existing `hardlink_missing_lightroom_photos` project should be extended to support this broader recovery workflow.
+## Recovery workflow
 
-## Background
-
-There are several different reasons Lightroom currently reports files as missing.
-
-Some originals appear to have genuinely disappeared from the current photo archive but still exist in older Time Machine backups.
-
-Other photos are probably not actually lost. Lightroom moved or reorganized files at some point, and Lightroom Cloud subsequently downloaded another copy into a newer location. Lightroom may therefore have one catalog record pointing to the old, now-missing pathname while an identical file exists elsewhere on the same filesystem.
-
-There are also historical duplicates caused by changes in photo-storage practices. In earlier years, camera RAW files were stored separately from processed/exported files. Later, the `RawPhotos` tree became the main repository for both RAW and JPEG originals. Consequently, there can be valid copies or derivatives scattered through older directory trees.
-
-Finally, there are some very large files, particularly scans, for which identical copies may legitimately exist in multiple locations and consume substantial disk space.
-
-## Source of Truth: Lightroom's Missing Photographs
-
-Lightroom Classic itself should determine which catalog records are missing.
-
-Use:
-
-**Library → Find All Missing Photos**
-
-This creates Lightroom's `Missing Photographs` collection.
-
-The recovery tools should work from an exported list of the expected full paths of those photos.
-
-The full expected path is essential because filenames such as `IMG_2302.JPG` or `DSC_0201.NEF` are frequently reused by cameras and are not globally unique.
-
-Example:
-
-```text
-/Volumes/Ladyhawke/RawPhotos/2013/2013-09-08/_JD07021.NEF
+```
+1. Export missing-photo paths from Lightroom (see below)
+2. Recover originals from Time Machine           ← recover_from_timemachine.py
+3. Re-run Lightroom "Find All Missing Photos"
+4. Find identical copies elsewhere and hardlink  ← FindLinkMatches plugin + relink_missing_photos.py
+5. Handle remaining gaps manually
 ```
 
-Files on volumes that are simply offline should not be treated as genuinely lost. The software should classify missing records by expected volume so that `/Volumes/Ladyhawke/...` can be processed independently of photos belonging on other disconnected drives.
+---
 
-## Recovery Priority
+## Step 1 — Export missing-photo paths from Lightroom
 
-Recovery should proceed from the highest-quality and most authoritative source to progressively weaker substitutes.
+Use Lightroom Classic's built-in **"Find All Missing Photos"** (Library menu) to
+populate the `Missing Photographs` smart collection.
 
-### Phase 1: Recover originals from Time Machine
+Then export the list using the
+**[Any Filter](https://www.johnrellis.com/lightroom/any-filter-readme.htm)**
+Lightroom plugin:
 
-This is now the highest priority.
+1. Select all photos in the `Missing Photographs` collection.
+2. In the Any Filter panel, use its **Sort/Export** function to export a CSV.
+3. Make sure the exported CSV includes at minimum the **full file path** column
+   (Any Filter calls this `Photo`).  Also include capture date/time, camera make,
+   width, and height if you plan to run the metadata-matching step later.
 
-A missing Lightroom original has already been found in a Time Machine snapshot from 2022-11-10:
+Save the file as `data/Missing_Photos.csv` (or pass a custom path to the scripts).
 
-```text
-/Volumes/Ladyhawke/RawPhotos/2013/2013-09-08/_JD07021.NEF
-```
+> **Note:** No custom Lua code is needed to export the missing-photo list.
+> Any Filter's built-in export covers this step completely.
 
-This demonstrates that older Time Machine backups may contain many of the originals that are currently absent from Ladyhawke.
+---
 
-The program should:
+## Phase 1 — Recover originals from Time Machine
 
-1. Read the Lightroom missing-photo path list.
-2. Restrict the first pass to expected paths under `/Volumes/Ladyhawke`.
-3. Search one or more mounted Time Machine snapshots for the corresponding historical path.
-4. Record whether each missing file exists in a backup.
-5. Prefer the newest backup containing the file.
-6. Initially produce a report only; do not automatically restore files.
-7. After review, restore verified files to the exact pathname Lightroom expects.
+**Script:** `recover_from_timemachine.py`  
+**Status:** Implemented; not yet tested against the live backup volume.  
+**Dependencies:** Python 3.9+, standard library only.
 
-Suggested classifications:
-
-```text
-FOUND_IN_TIME_MACHINE
-NOT_FOUND_IN_TIME_MACHINE
-CURRENTLY_PRESENT
-WRONG_VOLUME_OR_OFFLINE_VOLUME
-MULTIPLE_BACKUP_COPIES
-```
-
-For a Time Machine recovery, the preferred operation is normally a normal copy from the backup into the expected Lightroom pathname.
-
-Once the file exists at the path already recorded in the Lightroom catalog, Lightroom should recognize the original again without reimporting or relinking the catalog record.
-
-## Phase 2: Find identical copies elsewhere and hardlink them
-
-After recovering everything possible from Time Machine, rerun Lightroom's `Find All Missing Photos`.
-
-The remaining missing records become candidates for the existing purpose of this repository.
-
-For each missing expected pathname, search the current storage for another copy of the same original.
-
-Likely search locations include:
-
-```text
-/Volumes/Ladyhawke/RawPhotos
-/Volumes/Ladyhawke/Photos
-/Volumes/Ladyhawke/RawPhotoImports
-/Volumes/Ladyhawke/JpgFromTiff
-```
-
-and any other known historical photo-storage trees.
-
-Filename alone must never be considered sufficient evidence of identity.
-
-Matching should use progressively stronger evidence, for example:
-
-1. Exact pathname-history relationship where known.
-2. Exact file size.
-3. Cryptographic hash when the candidate and expected original can both be compared to a known source.
-4. EXIF capture timestamp.
-5. Camera make/model.
-6. Image dimensions.
-7. Other EXIF identifiers where available.
-8. Existing project metadata-comparison logic.
-9. Manual review for ambiguous cases.
-
-Where a confirmed identical file exists elsewhere on the **same filesystem**, create a hardlink at the pathname Lightroom expects.
-
-Example conceptually:
-
-```text
-existing good copy:
-    /Volumes/Ladyhawke/.../new-location/photo.NEF
-
-Lightroom expects:
-    /Volumes/Ladyhawke/.../old-location/photo.NEF
-```
-
-If they are confirmed to be the same original, create the missing pathname as another hardlink to the existing inode.
-
-This has several advantages:
-
-* Lightroom sees the file at its historical pathname.
-* No duplicate disk space is consumed.
-* The existing newer path continues to work.
-* Lightroom catalog manipulation is unnecessary.
-* Lightroom Cloud relationships remain attached to their existing catalog records.
-
-The software must verify that source and destination are on the same filesystem before attempting a hardlink.
-
-Ambiguous matches should never be linked automatically.
-
-## Why This Situation Exists
-
-A significant source of the missing records appears to be interaction between Lightroom Classic file movement and Lightroom Cloud synchronization.
-
-In some cases Lightroom has:
-
-1. had a catalog record for a file in an older pathname;
-2. moved or otherwise reorganized the original;
-3. later downloaded a cloud copy into the newer configured Lightroom sync location;
-4. retained another catalog record that still points to the old pathname.
-
-The result is that Lightroom reports the historical record as missing even though an identical file may already exist elsewhere on Ladyhawke.
-
-This is exactly the class of problem where hardlinking is preferable to importing another copy or trying to modify Lightroom's internal catalog references.
-
-## Phase 3: Historical Photos Tree Audit
-
-Separately from direct missing-photo recovery, the old:
-
-```text
-/Volumes/Ladyhawke/Photos
-```
-
-tree should eventually be audited.
-
-Historically, this directory was the principal viewable-photo archive. RAW originals lived separately because normal image-viewing software of the period could not conveniently display RAW files. Processed JPEGs were exported into `Photos`, while JPEG camera originals could also live there directly.
-
-Starting roughly around 2009, the workflow changed and `RawPhotos` increasingly became the repository for all originals, including JPEGs.
-
-Therefore, even post-2008 files under `Photos` cannot simply be assumed to be exports or duplicates.
-
-The future audit should identify files in `Photos` that have no equivalent original elsewhere.
-
-Possible classifications:
-
-```text
-EXACT_DUPLICATE
-LIKELY_RAW_EXPORT
-LIKELY_SAME_IMAGE_REENCODED
-UNIQUE_PHOTOS_TREE_FILE
-AMBIGUOUS
-```
-
-`UNIQUE_PHOTOS_TREE_FILE` records are potentially important surviving originals and should be preserved or incorporated into the modern archive.
-
-This audit should be database/report driven and should not delete or move files automatically.
-
-## Lightroom Cloud as a Fallback
-
-Some missing Lightroom photos are in `All Synced Photographs`.
-
-This can provide a last-resort recovery source, but the cloud copy may only be a Smart Preview rather than the original.
-
-For example, Lightroom may display metadata describing an original NEF at full native dimensions, while Lightroom Web only permits downloading a smaller derivative such as approximately 2048 pixels on the long edge.
-
-Therefore cloud recovery should rank below recovery of an actual original from Time Machine or another filesystem location.
-
-Fallback order should generally be:
-
-```text
-Time Machine original
-    ↓
-Identical original elsewhere
-    ↓
-Other archive containing original
-    ↓
-Full-resolution historical JPEG/export
-    ↓
-Lightroom Cloud Smart Preview
-    ↓
-No surviving image
-```
-
-Cloud-derived recovery files should be preserved separately unless there is a deliberate decision about how to represent them in Lightroom.
-
-## Phase 4: Optional Duplicate-Space Cleanup with rdfind
-
-After missing-photo recovery is complete and verified, disk-space cleanup can be considered as a separate operation.
-
-Some very large scans or other files may exist in multiple directories as byte-for-byte duplicates.
-
-`rdfind` can identify identical files and replace duplicates with hardlinks.
-
-This should be treated as an optional final phase, not part of missing-photo recovery.
-
-The workflow should be:
-
-1. Run `rdfind` in report/dry-run mode.
-2. Review duplicate groups.
-3. Pay particular attention to very large scans where hardlinking offers meaningful space savings.
-4. Ensure all candidate files are on the same filesystem.
-5. Only then allow `rdfind` to replace verified duplicates with hardlinks.
-
-Do not use perceptual similarity for this operation. Only byte-identical files should be automatically hardlinked for deduplication.
-
-## Safety Rules
-
-The recovery software should be conservative.
-
-* Default to reporting rather than modifying.
-* Never overwrite an existing destination file without explicit verification.
-* Never treat filename equality as proof of identity.
-* Never automatically resolve ambiguous matches.
-* Never import recovered files into Lightroom as new photos if the existing Lightroom catalog record can simply be repaired by restoring the expected pathname.
-* Preserve Lightroom's existing catalog identity whenever possible.
-* Record every filesystem modification in a log.
-* Support dry-run mode for every operation that writes files.
-* Where possible, hash files before destructive or identity-sensitive operations.
-* Never modify Time Machine backups.
-* Keep Time Machine recovery, hardlink recovery, and duplicate cleanup as distinct operations.
-
-## Suggested Development Structure
-
-The existing repository can evolve into several explicit stages or commands:
-
-```text
-1. export_missing
-   Obtain Lightroom's expected missing paths.
-
-2. scan_timemachine
-   Search mounted Time Machine backups for missing originals.
-
-3. restore_timemachine
-   Restore explicitly approved originals to their expected paths.
-
-4. find_existing_matches
-   Search current storage for identical copies of remaining missing files.
-
-5. hardlink_matches
-   Create approved hardlinks at Lightroom's expected paths.
-
-6. verify
-   Confirm expected files now exist and rerun Lightroom's missing-photo check.
-
-7. audit_photos_tree
-   Identify unique legacy files in /Volumes/Ladyhawke/Photos.
-
-8. deduplicate
-   Optionally use rdfind or equivalent for byte-identical large files.
-```
-
-The existing Lightroom plugin and Python matching/relinking code should be reused rather than replaced where possible.
-
-## Immediate Next Steps
-
-The immediate development target is the Time Machine recovery phase.
-
-1. Generate/export the complete Lightroom `Missing Photographs` list with full expected paths.
-2. Separate `/Volumes/Ladyhawke/...` records from missing records on other volumes.
-3. Determine the mounted path structure of the 2022-11-10 Time Machine snapshot.
-4. Write a read-only scanner that maps each missing Ladyhawke pathname to the corresponding pathname inside the Time Machine snapshot.
-5. Produce a CSV report of recoverable and unrecoverable files.
-6. Verify several examples manually.
-7. Add a controlled restore mode.
-8. Rerun Lightroom `Find All Missing Photos`.
-9. Feed the remaining list into the existing hardlink-matching workflow.
-
-The first objective is not deduplication. It is to recover the highest-quality surviving original for every Lightroom catalog record that can still be recovered.
-
-## Phase 1 Implementation: `recover_from_timemachine.py`
-
-`recover_from_timemachine.py` implements the Time Machine recovery phase described above.
-It is a standalone Python 3 script that uses only the standard library.
-
-### Prerequisites
-
-Python 3.9 or later.  No third-party packages required (the script does not use
-`pandas`, `PIL`, or `exiftool`).
-
-### Commands
-
-#### inspect — discover backup structure
+### inspect — discover the backup structure
 
 ```bash
 python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
 ```
 
-Inspects the mounted Time Machine volume and reports:
+Walks the Time Machine volume and reports the layout type, host/computer names,
+available snapshots, and which snapshots contain a `Ladyhawke` volume directory.
+Read-only; modifies nothing.
 
-* the layout type (modern `Backups.backupdb/` or unknown);
-* the host/computer names present in the backup;
-* the total number of snapshots and which contain a `Ladyhawke` volume directory;
-* the newest and oldest snapshots that can be used for recovery.
-
-No files are modified.
-
-#### scan — find missing originals in Time Machine
+### scan — find missing originals in Time Machine
 
 ```bash
 python3 recover_from_timemachine.py scan \
@@ -337,77 +68,181 @@ python3 recover_from_timemachine.py scan \
     /Volumes/iMacBackup3
 ```
 
-Reads the Lightroom missing-photo CSV (same format produced by the existing
-Lightroom plugin — must have a `Photo` column containing the full expected path).
+For each entry in the missing-photos CSV, derives the relative path under
+`/Volumes/Ladyhawke` and searches all available snapshots (newest first).
 
-For each missing photo:
+Each record is classified as one of:
 
-* classifies records not under `/Volumes/Ladyhawke` as `NON_LADYHAWKE_PATH`;
-* records already present on disk as `CURRENTLY_PRESENT` (no recovery needed);
-* derives the relative path (e.g. `RawPhotos/2013/2013-09-08/_JD07021.NEF`);
-* searches all available Ladyhawke snapshots, newest-first;
-* classifies as `FOUND_IN_TIME_MACHINE`, `MULTIPLE_TIME_MACHINE_VERSIONS`, or
-  `NOT_FOUND_IN_TIME_MACHINE`.
+| Status | Meaning |
+|--------|---------|
+| `FOUND_IN_TIME_MACHINE` | Exactly one snapshot contains the file |
+| `MULTIPLE_TIME_MACHINE_VERSIONS` | Multiple snapshots match; newest is used |
+| `NOT_FOUND_IN_TIME_MACHINE` | File absent from all inspected snapshots |
+| `CURRENTLY_PRESENT` | File already exists on Ladyhawke — no recovery needed |
+| `NON_LADYHAWKE_PATH` | Expected path is on a different volume; out of scope here |
 
-Writes a detailed CSV report (default: `data/timemachine_recovery_candidates.csv`):
+Writes `data/timemachine_recovery_candidates.csv` (columns: `status`,
+`expected_path`, `relative_path`, `backup_path`, `backup_date`, `file_size`,
+`mtime`, `notes`) and prints a summary.
 
-```
-status, expected_path, relative_path, backup_path, backup_date,
-file_size, mtime, notes
-```
+Use `--output <path>` to write the report somewhere else.
 
-and prints a concise summary, for example:
-
-```
-Missing Lightroom records examined :   1,234
-Ladyhawke records                  :   1,087
-  Already present on disk          :      12
-  Found in Time Machine            :     814
-  Multiple TM versions             :      50
-  Not found in Time Machine        :     211
-Other/non-Ladyhawke volumes        :      75
-Total recoverable from TM          :     864
-```
-
-Use `--output` to specify a different report path.
-
-#### restore — copy originals back (dry-run by default)
+### restore — copy originals back (dry-run by default)
 
 ```bash
-# Preview only (default — no files are copied):
+# Preview only — no files are written:
 python3 recover_from_timemachine.py restore \
-    --report data/timemachine_recovery_candidates.csv \
-    --dry-run
+    --report data/timemachine_recovery_candidates.csv
 
-# Actually copy files (requires explicit flag):
+# Actually copy (requires explicit flag):
 python3 recover_from_timemachine.py restore \
     --report data/timemachine_recovery_candidates.csv \
     --execute
 ```
 
-Reads the recovery candidates CSV and, for every `FOUND_IN_TIME_MACHINE` or
-`MULTIPLE_TIME_MACHINE_VERSIONS` record, copies the backup original to the exact
-pathname Lightroom already expects.
+For every `FOUND_IN_TIME_MACHINE` or `MULTIPLE_TIME_MACHINE_VERSIONS` record,
+copies the backup file to the exact pathname Lightroom expects, using a normal
+copy (`shutil.copy2`) — never a hardlink to the backup volume.
 
-Safety rules enforced:
+Safety guarantees:
+- `--dry-run` is the default; `--execute` must be passed explicitly.
+- The Time Machine backup is never modified.
+- Existing destination files are never overwritten.
+- Source is verified to be a regular file before any copy.
+- Missing destination directories are created automatically.
+- File metadata (timestamps) is preserved.
+- Every operation is logged to `data/restore_log.csv`.
 
-* dry-run is the default — `--execute` must be passed explicitly;
-* the Time Machine backup is never modified;
-* existing destination files are never overwritten;
-* source is verified to be a regular file before copying;
-* missing destination directories are created automatically;
-* file metadata (timestamps) is preserved via `shutil.copy2`;
-* every operation is written to a log CSV (default: `data/restore_log.csv`).
+Add `--verify-hash` to calculate a SHA-256 digest for each file copied.
 
-Optional `--verify-hash` calculates a SHA-256 digest for each copied file.
-
-#### hash — manual file verification
+### hash — manual integrity check
 
 ```bash
-python3 recover_from_timemachine.py hash \
-    /Volumes/iMacBackup3/Backups.backupdb/.../Ladyhawke/RawPhotos/2013/2013-09-08/_JD07021.NEF \
-    /Volumes/Ladyhawke/RawPhotos/2013/2013-09-08/_JD07021.NEF
+python3 recover_from_timemachine.py hash <file1> [<file2> ...]
 ```
 
-Prints SHA-256 hashes for one or more files so that backup copies can be
-compared with restored copies or other candidates.
+Prints the SHA-256 hash of each file.  Useful for comparing a backup copy against
+a restored copy or another candidate.
+
+---
+
+## Phase 2 — Find identical copies and hardlink them
+
+After recovering everything possible from Time Machine, re-run
+**Library → Find All Missing Photos** in Lightroom, then export a fresh CSV.
+
+### Step 2a — Find candidates with the Lightroom plugin
+
+**Plugin:** `FindLinkMatches.lrplugin`  
+**Status:** Implemented; not yet fully end-to-end tested.
+
+Install the plugin via Lightroom's Plugin Manager.  With the
+`Missing Photographs` collection selected, run:
+
+**Library → Plug-in Extras → Find Matches to Missing Photos**
+
+The plugin searches the active catalog for non-missing photos whose filename stem,
+capture timestamp (within 5 minutes), camera model, and dimensions all match the
+missing photo.  It writes three files to the Desktop:
+
+| File | Contents |
+|------|----------|
+| `link_missing.sh` | `ln` commands for unambiguous single matches |
+| `ambiguous_match.csv` | Missing paths with multiple candidate matches |
+| `possible_matches.txt` | Weaker candidates where metadata partially matches |
+
+Review these files before running anything.
+
+### Step 2b — Refine candidates with Python (optional)
+
+**Script:** `relink_missing_photos.py`  
+**Status:** Implemented; not yet fully end-to-end tested.  
+**Dependencies:** Python 3.9+, `pandas`, `python-dateutil`, `exiftool` (CLI tool).
+
+```bash
+# Install Python dependencies:
+source setup.env   # or: pip install pandas python-dateutil
+
+python3 relink_missing_photos.py data/Missing_Photos.csv
+```
+
+Indexes all files under `/Volumes/Ladyhawke` by filename stem, then matches each
+missing photo against candidates using `exiftool`-extracted EXIF data (timestamp,
+camera make, width, height).  Handles resolution mismatches separately.
+
+Options:
+
+```
+--test-n N               Process a random sample of N rows (for testing)
+--exclude-sources PATH   Exclude directory subtrees from candidate indexing
+--exclude-targets PATH   Skip missing-photo entries whose path contains this string
+```
+
+Outputs (written to the current working directory):
+
+| File | Contents |
+|------|----------|
+| `relink_good_matches.sh` | `ln` commands for confirmed matches |
+| `resolution_mismatch.sh` | Best-guess links where resolution differs |
+| `Still_Missing_Photos.csv` | Records with no match found |
+
+### Step 2c — Compare metadata for a specific file
+
+```bash
+python3 compare_metadata.py data/Missing_Photos.csv <expected_filename> <candidate_path>
+```
+
+Loads metadata from the CSV for `<expected_filename>` and compares it against
+`<candidate_path>` using exiftool.  Useful for manually verifying a specific
+candidate before linking.
+
+### Step 2d — Apply the hardlinks
+
+Review `relink_good_matches.sh`, then run it:
+
+```bash
+bash relink_good_matches.sh
+```
+
+This creates hardlinks at Lightroom's expected pathnames without consuming
+additional disk space and without modifying the Lightroom catalog.
+
+---
+
+## Prerequisites summary
+
+| Tool | Used by | Install |
+|------|---------|---------|
+| Python 3.9+ | All Python scripts | `brew install python` or system Python |
+| `pandas` | `relink_missing_photos.py` | `pip install pandas` |
+| `python-dateutil` | `relink_missing_photos.py` | `pip install python-dateutil` |
+| `exiftool` | `relink_missing_photos.py`, `compare_metadata.py` | `brew install exiftool` |
+| Any Filter plugin | Lightroom export step | [johnrellis.com](https://www.johnrellis.com/lightroom/any-filter-readme.htm) |
+
+`recover_from_timemachine.py` uses only the Python standard library.
+
+---
+
+## Repository layout
+
+```
+FindLinkMatches.lrplugin/   Lightroom plugin — find catalog matches for missing photos
+  Info.lua                  Plugin metadata
+  main.lua                  Plugin logic
+
+recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine
+relink_missing_photos.py    Phase 2: index filesystem + match by EXIF metadata
+compare_metadata.py         Manual metadata comparison helper
+
+data/
+  Missing_Photos.csv        Input: exported from Lightroom via Any Filter
+  timemachine_recovery_candidates.csv   Output of recover_from_timemachine scan
+  restore_log.csv           Log of restore operations
+
+Still_Missing_Photos.csv    Photos with no match after Phase 2
+ambiguous_matches.csv       Photos with multiple conflicting candidates
+relink_good_matches.sh      Generated hardlink commands (review before running)
+setup.env                   pip install commands for Python dependencies
+DESIGN.md                   Full design rationale and planned future phases
+```
+
