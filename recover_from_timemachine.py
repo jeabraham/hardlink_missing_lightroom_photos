@@ -478,6 +478,50 @@ def is_apfs_backup_path(backup_path: str) -> bool:
 # APFS-specific snapshot scanning (mount each snapshot once, check all files)
 # ---------------------------------------------------------------------------
 
+def _find_ladyhawke_in_snapshot(mountpoint: Path) -> Path | None:
+    """
+    Locate the ``Ladyhawke`` directory inside a mounted APFS Time Machine snapshot.
+
+    On this backup volume the structure is::
+
+        <mountpoint>/
+            <dated-backup-dir>.backup/
+                Ladyhawke/          ← what we want
+                Data/
+                Homes/
+                ...
+            backup_manifest.plist
+            ...
+
+    The function scans the top-level non-hidden directories of ``mountpoint``
+    for a subdirectory named ``Ladyhawke`` (case-insensitive), returning the
+    first match.  Falls back to ``mountpoint / "Ladyhawke"`` if nothing is
+    found one level deeper.
+    """
+    try:
+        top_entries = [
+            e for e in mountpoint.iterdir()
+            if e.is_dir() and not e.name.startswith(".")
+        ]
+    except OSError:
+        return None
+
+    for top_dir in sorted(top_entries):
+        try:
+            for sub in top_dir.iterdir():
+                if sub.is_dir() and sub.name.lower() == "ladyhawke":
+                    return sub
+        except OSError:
+            continue
+
+    # Last resort: check directly under mountpoint (older layout).
+    direct = mountpoint / "Ladyhawke"
+    if direct.is_dir():
+        return direct
+
+    return None
+
+
 def _debug_snapshot_tree(mountpoint: Path, depth: int = 3) -> None:
     """
     Print the directory tree of a mounted snapshot up to ``depth`` levels deep.
@@ -531,26 +575,30 @@ def scan_apfs_snapshots(
 
         try:
             with _mount_apfs_snapshot(snap_name, tm_volume) as mountpoint:
-                lh_root = mountpoint / "Ladyhawke"
+                lh_root = _find_ladyhawke_in_snapshot(mountpoint)
 
                 if debug and not _debug_done:
                     _debug_done = True
                     _debug_snapshot_tree(mountpoint, depth=3)
-                    lh_exists = lh_root.exists()
                     print(
-                        f"\n  DEBUG: mountpoint/Ladyhawke = {lh_root}",
+                        f"\n  DEBUG: Ladyhawke root found at: {lh_root}",
                         file=sys.stderr,
                     )
-                    print(
-                        f"  DEBUG: Ladyhawke subdir exists: {lh_exists}",
-                        file=sys.stderr,
-                    )
-                    for rel in rel_paths:
+                    if lh_root is not None:
+                        for rel in rel_paths:
+                            print(
+                                f"  DEBUG: searching for: {lh_root / rel}",
+                                file=sys.stderr,
+                            )
+                    else:
                         print(
-                            f"  DEBUG: searching for: {lh_root / rel}",
+                            "  DEBUG: Ladyhawke not found in snapshot — skipping search.",
                             file=sys.stderr,
                         )
                     print("", file=sys.stderr)
+
+                if lh_root is None:
+                    continue
 
                 for rel in rel_paths:
                     candidate = lh_root / rel
@@ -1153,6 +1201,7 @@ def cmd_restore(args):
         )
         try:
             with _mount_apfs_snapshot(snap_name, tm_vol) as mountpoint:
+                lh_root = _find_ladyhawke_in_snapshot(mountpoint)
                 for row in group_list:
                     backup = row["backup_path"]
                     expected = row["expected_path"]
@@ -1164,7 +1213,12 @@ def cmd_restore(args):
                             notes="Malformed APFS backup path")
                         errors += 1
                         continue
-                    src = mountpoint / "Ladyhawke" / rel
+                    if lh_root is None:
+                        log("COPY", "ERROR", backup, expected,
+                            notes="Ladyhawke not found in mounted snapshot")
+                        errors += 1
+                        continue
+                    src = lh_root / rel
                     _restore_file(src, Path(expected), backup, expected, date)
         except OSError as exc:
             for row in group_list:
