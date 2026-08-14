@@ -1,8 +1,8 @@
 return {
   LrSdkVersion = 10.0,
-  LrPluginName = "Find Matches to Missing Photos To Possibly Link",
-  LrToolkitIdentifier = "com.yourdomain.findmissingmatches",
-  LrPluginInfoUrl = "https://yourdomain.com/lightroom/findmissingmatches",
+  LrPluginName = "Find Matches to Missing Photos",
+  LrToolkitIdentifier = "com.github.jeabraham.findmissingmatches",
+  LrPluginInfoUrl = "https://github.com/jeabraham/hardlink_missing_lightroom_photos",
 
   LrLibraryMenuItems = {
     {

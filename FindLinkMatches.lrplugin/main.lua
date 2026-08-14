@@ -13,7 +13,11 @@ local desktop = LrPathUtils.getStandardFilePath("desktop")
 local TIME_DELTA = 5 * 60 -- 5 minutes in seconds
 
 local function logToFile(path, content)
-    local f = io.open(path, "a")
+    local f, err = io.open(path, "a")
+    if not f then
+        LrDialogs.message("Log write error", "Could not open " .. path .. ": " .. (err or "unknown error"))
+        return
+    end
     f:write(content .. "\n")
     f:close()
 end
