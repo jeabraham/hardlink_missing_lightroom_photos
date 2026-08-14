@@ -312,14 +312,50 @@ def find_in_snapshots(rel_path: str, snapshots: list) -> list:
     """
     found = []
     for lh_root, date_str in snapshots:
-        if _snapshot_contains_path(lh_root, rel_path):
-            found.append((lh_root / rel_path, date_str))
+        actual = _resolve_case_insensitive(lh_root / rel_path)
+        if actual is not None:
+            found.append((actual, date_str))
     return found
+
+
+def _resolve_case_insensitive(candidate: Path) -> Path | None:
+    """
+    Return the actual on-disk path for ``candidate``, matching
+    case-insensitively at every path component that doesn't exist verbatim.
+
+    Returns the resolved Path if a matching file is found, or None.
+    """
+    if candidate.is_file():
+        return candidate
+
+    # Walk from the filesystem root toward the candidate, resolving each
+    # component case-insensitively when the exact name is absent.
+    parts = candidate.parts  # e.g. ('/', 'tmp', 'snap', 'RawPhotos', 'foo.JPG')
+    resolved = Path(parts[0])
+    for part in parts[1:]:
+        exact = resolved / part
+        if exact.exists():
+            resolved = exact
+        else:
+            # Try case-insensitive match among the directory's children.
+            try:
+                children = list(resolved.iterdir())
+            except OSError:
+                return None
+            part_lower = part.lower()
+            match = next(
+                (c for c in children if c.name.lower() == part_lower), None
+            )
+            if match is None:
+                return None
+            resolved = match
+
+    return resolved if resolved.is_file() else None
 
 
 def _snapshot_contains_path(lh_root: Path, rel_path: str) -> bool:
     candidate = lh_root / rel_path
-    return candidate.is_file()
+    return _resolve_case_insensitive(candidate) is not None
 
 
 def _snapshot_month_key(date_str: str) -> str | None:
@@ -389,8 +425,9 @@ def find_in_snapshots_anchored(
     found = []
     for idx in range(0, found_anchor_idx + 1):
         lh_root, date_str = snapshots[idx]
-        if _snapshot_contains_path(lh_root, rel_path):
-            found.append((lh_root / rel_path, date_str))
+        actual = _resolve_case_insensitive(lh_root / rel_path)
+        if actual is not None:
+            found.append((actual, date_str))
     return found
 
 
@@ -469,10 +506,13 @@ def scan_apfs_snapshots(
                 lh_root = mountpoint / "Ladyhawke"
                 for rel in rel_paths:
                     candidate = lh_root / rel
-                    if candidate.is_file():
-                        stat = file_stat(candidate)
+                    actual = _resolve_case_insensitive(candidate)
+                    if actual is not None:
+                        # Use the actual on-disk relative path (may differ in case).
+                        actual_rel = str(actual.relative_to(lh_root))
+                        stat = file_stat(actual)
                         results[rel].append((
-                            _apfs_backup_path(tm_volume, snap_name, rel),
+                            _apfs_backup_path(tm_volume, snap_name, actual_rel),
                             date_str,
                             stat["file_size"],
                             stat["mtime"],
