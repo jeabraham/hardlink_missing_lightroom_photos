@@ -301,3 +301,113 @@ The immediate development target is the Time Machine recovery phase.
 9. Feed the remaining list into the existing hardlink-matching workflow.
 
 The first objective is not deduplication. It is to recover the highest-quality surviving original for every Lightroom catalog record that can still be recovered.
+
+## Phase 1 Implementation: `recover_from_timemachine.py`
+
+`recover_from_timemachine.py` implements the Time Machine recovery phase described above.
+It is a standalone Python 3 script that uses only the standard library.
+
+### Prerequisites
+
+Python 3.9 or later.  No third-party packages required (the script does not use
+`pandas`, `PIL`, or `exiftool`).
+
+### Commands
+
+#### inspect — discover backup structure
+
+```bash
+python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
+```
+
+Inspects the mounted Time Machine volume and reports:
+
+* the layout type (modern `Backups.backupdb/` or unknown);
+* the host/computer names present in the backup;
+* the total number of snapshots and which contain a `Ladyhawke` volume directory;
+* the newest and oldest snapshots that can be used for recovery.
+
+No files are modified.
+
+#### scan — find missing originals in Time Machine
+
+```bash
+python3 recover_from_timemachine.py scan \
+    data/Missing_Photos.csv \
+    /Volumes/iMacBackup3
+```
+
+Reads the Lightroom missing-photo CSV (same format produced by the existing
+Lightroom plugin — must have a `Photo` column containing the full expected path).
+
+For each missing photo:
+
+* classifies records not under `/Volumes/Ladyhawke` as `NON_LADYHAWKE_PATH`;
+* records already present on disk as `CURRENTLY_PRESENT` (no recovery needed);
+* derives the relative path (e.g. `RawPhotos/2013/2013-09-08/_JD07021.NEF`);
+* searches all available Ladyhawke snapshots, newest-first;
+* classifies as `FOUND_IN_TIME_MACHINE`, `MULTIPLE_TIME_MACHINE_VERSIONS`, or
+  `NOT_FOUND_IN_TIME_MACHINE`.
+
+Writes a detailed CSV report (default: `data/timemachine_recovery_candidates.csv`):
+
+```
+status, expected_path, relative_path, backup_path, backup_date,
+file_size, mtime, notes
+```
+
+and prints a concise summary, for example:
+
+```
+Missing Lightroom records examined :   1,234
+Ladyhawke records                  :   1,087
+  Already present on disk          :      12
+  Found in Time Machine            :     814
+  Multiple TM versions             :      50
+  Not found in Time Machine        :     211
+Other/non-Ladyhawke volumes        :      75
+Total recoverable from TM          :     864
+```
+
+Use `--output` to specify a different report path.
+
+#### restore — copy originals back (dry-run by default)
+
+```bash
+# Preview only (default — no files are copied):
+python3 recover_from_timemachine.py restore \
+    --report data/timemachine_recovery_candidates.csv \
+    --dry-run
+
+# Actually copy files (requires explicit flag):
+python3 recover_from_timemachine.py restore \
+    --report data/timemachine_recovery_candidates.csv \
+    --execute
+```
+
+Reads the recovery candidates CSV and, for every `FOUND_IN_TIME_MACHINE` or
+`MULTIPLE_TIME_MACHINE_VERSIONS` record, copies the backup original to the exact
+pathname Lightroom already expects.
+
+Safety rules enforced:
+
+* dry-run is the default — `--execute` must be passed explicitly;
+* the Time Machine backup is never modified;
+* existing destination files are never overwritten;
+* source is verified to be a regular file before copying;
+* missing destination directories are created automatically;
+* file metadata (timestamps) is preserved via `shutil.copy2`;
+* every operation is written to a log CSV (default: `data/restore_log.csv`).
+
+Optional `--verify-hash` calculates a SHA-256 digest for each copied file.
+
+#### hash — manual file verification
+
+```bash
+python3 recover_from_timemachine.py hash \
+    /Volumes/iMacBackup3/Backups.backupdb/.../Ladyhawke/RawPhotos/2013/2013-09-08/_JD07021.NEF \
+    /Volumes/Ladyhawke/RawPhotos/2013/2013-09-08/_JD07021.NEF
+```
+
+Prints SHA-256 hashes for one or more files so that backup copies can be
+compared with restored copies or other candidates.
