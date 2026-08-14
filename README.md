@@ -69,7 +69,28 @@ python3 recover_from_timemachine.py scan \
 ```
 
 For each entry in the missing-photos CSV, derives the relative path under
-`/Volumes/Ladyhawke` and searches all available snapshots (newest first).
+`/Volumes/Ladyhawke` and searches snapshots (newest first).
+
+Search strategies:
+
+- `--search-mode full` (default): exhaustive search across all snapshots.
+- `--search-mode anchored`: two-phase search for faster scans on large backup
+  histories:
+  1. Probe monthly anchor snapshots (first chronological snapshot in each month),
+     stepping by `--month-interval` months (`1` = every month, `2` = every other
+     month, etc.).
+  2. Once a monthly anchor contains the file, scan forward in time toward newer
+     snapshots to find the newest available copy.
+
+Example anchored scan:
+
+```bash
+python3 recover_from_timemachine.py scan \
+    data/Missing_Photos.csv \
+    /Volumes/iMacBackup3 \
+    --search-mode anchored \
+    --month-interval 1
+```
 
 Each record is classified as one of:
 
@@ -86,6 +107,11 @@ Writes `data/timemachine_recovery_candidates.csv` (columns: `status`,
 `mtime`, `notes`) and prints a summary.
 
 Use `--output <path>` to write the report somewhere else.
+
+Tradeoff:
+- `full` mode is exhaustive and best when you want complete historical coverage.
+- `anchored` mode usually runs faster but may skip matches that only exist in
+  non-anchor months before the first anchored hit.
 
 ### restore — copy originals back (dry-run by default)
 
@@ -245,4 +271,3 @@ relink_good_matches.sh      Generated hardlink commands (review before running)
 setup.env                   pip install commands for Python dependencies
 DESIGN.md                   Full design rationale and planned future phases
 ```
-

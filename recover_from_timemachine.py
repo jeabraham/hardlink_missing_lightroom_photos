@@ -18,6 +18,7 @@ import argparse
 import csv
 import hashlib
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -191,9 +192,85 @@ def find_in_snapshots(rel_path: str, snapshots: list) -> list:
     """
     found = []
     for lh_root, date_str in snapshots:
-        candidate = lh_root / rel_path
-        if candidate.is_file():
-            found.append((candidate, date_str))
+        if _snapshot_contains_path(lh_root, rel_path):
+            found.append((lh_root / rel_path, date_str))
+    return found
+
+
+def _snapshot_contains_path(lh_root: Path, rel_path: str) -> bool:
+    candidate = lh_root / rel_path
+    return candidate.is_file()
+
+
+def _snapshot_month_key(date_str: str) -> str | None:
+    """
+    Extract a YYYY-MM month key from a Time Machine snapshot directory name.
+    Returns None if no valid month-like prefix is present.
+    """
+    m = re.match(r"^(\d{4})-(\d{2})", date_str)
+    if not m:
+        return None
+    month = int(m.group(2))
+    if month < 1 or month > 12:
+        return None
+    return f"{m.group(1)}-{m.group(2)}"
+
+
+def build_month_anchor_indices(snapshots: list) -> list[int]:
+    """
+    Build month anchors for snapshots ordered newest-first.
+
+    Returns snapshot indices for the first chronological snapshot in each month
+    (typically the oldest snapshot in that month), with months ordered
+    newest-to-oldest.
+    """
+    month_order = []
+    month_to_index = {}
+
+    for idx, (_, date_str) in enumerate(snapshots):
+        key = _snapshot_month_key(date_str) or f"unknown:{date_str}"
+        if key not in month_to_index:
+            month_order.append(key)
+        # Overwrite so we keep the oldest-in-month index for this month.
+        month_to_index[key] = idx
+
+    return [month_to_index[key] for key in month_order]
+
+
+def find_in_snapshots_anchored(
+    rel_path: str,
+    snapshots: list,
+    month_anchor_indices: list[int],
+    month_interval: int = 1,
+) -> list:
+    """
+    Two-phase snapshot search:
+      1) Probe month anchors at the configured month interval.
+      2) Once found, scan forward in time (toward newer snapshots) to pick the
+         newest available match and keep all matches in that forward window.
+    """
+    if month_interval < 1:
+        raise ValueError("month_interval must be >= 1")
+    if not snapshots:
+        return []
+
+    anchor_probe_indices = month_anchor_indices[::month_interval]
+    found_anchor_idx = None
+
+    for idx in anchor_probe_indices:
+        lh_root, _ = snapshots[idx]
+        if _snapshot_contains_path(lh_root, rel_path):
+            found_anchor_idx = idx
+            break
+
+    if found_anchor_idx is None:
+        return []
+
+    found = []
+    for idx in range(0, found_anchor_idx + 1):
+        lh_root, date_str = snapshots[idx]
+        if _snapshot_contains_path(lh_root, rel_path):
+            found.append((lh_root / rel_path, date_str))
     return found
 
 
@@ -289,6 +366,22 @@ def cmd_scan(args):
             file=sys.stderr,
         )
 
+    search_mode = args.search_mode
+    month_interval = args.month_interval
+    month_anchor_indices = []
+    if search_mode == "anchored":
+        if month_interval < 1:
+            print("ERROR: --month-interval must be >= 1", file=sys.stderr)
+            sys.exit(1)
+        month_anchor_indices = build_month_anchor_indices(snapshots)
+        print(
+            "  Anchored mode: "
+            f"{len(month_anchor_indices)} monthly anchors, interval={month_interval}.",
+            file=sys.stderr,
+        )
+    else:
+        print("  Full mode: scanning all snapshots for each file.", file=sys.stderr)
+
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -351,7 +444,15 @@ def cmd_scan(args):
                 continue
 
             # Search Time Machine snapshots.
-            matches = find_in_snapshots(rel, snapshots)
+            if search_mode == "anchored":
+                matches = find_in_snapshots_anchored(
+                    rel,
+                    snapshots,
+                    month_anchor_indices=month_anchor_indices,
+                    month_interval=month_interval,
+                )
+            else:
+                matches = find_in_snapshots(rel, snapshots)
 
             if not matches:
                 counters["not_found"] += 1
@@ -616,6 +717,25 @@ def build_parser():
         "--output",
         default=DEFAULT_REPORT,
         help=f"Output CSV report path (default: {DEFAULT_REPORT}).",
+    )
+    p_scan.add_argument(
+        "--search-mode",
+        choices=("full", "anchored"),
+        default="full",
+        help=(
+            "Snapshot search strategy. "
+            "'full' scans all snapshots (exhaustive). "
+            "'anchored' probes monthly anchors first, then scans forward to newest match."
+        ),
+    )
+    p_scan.add_argument(
+        "--month-interval",
+        type=int,
+        default=1,
+        help=(
+            "Month step used by --search-mode anchored (default: 1). "
+            "Example: 1 probes every month, 2 probes every other month."
+        ),
     )
     p_scan.set_defaults(func=cmd_scan)
 
