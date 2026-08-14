@@ -5,9 +5,7 @@ import sys
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from PIL import ExifTags
 import pandas as pd
-import random
 from dateutil import parser as dateparser
 
 # Constants

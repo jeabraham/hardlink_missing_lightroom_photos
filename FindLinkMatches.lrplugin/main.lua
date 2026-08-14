@@ -13,7 +13,11 @@ local desktop = LrPathUtils.getStandardFilePath("desktop")
 local TIME_DELTA = 5 * 60 -- 5 minutes in seconds
 
 local function logToFile(path, content)
-    local f = io.open(path, "a")
+    local f, err = io.open(path, "a")
+    if not f then
+        LrDialogs.message("Log write error", "Could not open " .. path .. ": " .. (err or "unknown error"))
+        return
+    end
     f:write(content .. "\n")
     f:close()
 end
@@ -35,50 +39,43 @@ local function findAndCompareMissingPhotos()
     LrFileUtils.delete(possiblePath)
 
     for _, photo in ipairs(photos) do
-        if not photo:isMissing() then
-            -- skip non-missing photos
-            goto continue
-        end
+        if photo:isMissing() then
+            local fileName = photo:getFormattedMetadata("fileName")
+            local nameWithoutExt = fileName:match("(.+)%..+$")
+            local dateTime = photo:getRawMetadata("dateTimeOriginal")
+            local camera = photo:getFormattedMetadata("cameraModel") or ""
+            local width = photo:getRawMetadata("width")
+            local height = photo:getRawMetadata("height")
 
-        local fileName = photo:getFormattedMetadata("fileName")
-        local nameWithoutExt = fileName:match("(.+)%..+$")
-        local dateTime = photo:getRawMetadata("dateTimeOriginal")
-        local camera = photo:getFormattedMetadata("cameraModel") or ""
-        local width = photo:getRawMetadata("width")
-        local height = photo:getRawMetadata("height")
+            local candidates = catalog:findPhotos({searchDesc = { {criteria="filename", operation="contains", value=nameWithoutExt, searchable=true} }})
+            local matches = {}
+            local possibles = {}
 
-        local candidates = catalog:findPhotos({searchDesc = { {criteria="filename", operation="contains", value=nameWithoutExt, searchable=true} }})
-        local matches = {}
-        local possibles = {}
+            for _, candidate in ipairs(candidates) do
+                if candidate ~= photo and not candidate:isMissing() then
+                    local cTime = candidate:getRawMetadata("dateTimeOriginal")
+                    local cCamera = candidate:getFormattedMetadata("cameraModel") or ""
+                    local cWidth = candidate:getRawMetadata("width")
+                    local cHeight = candidate:getRawMetadata("height")
 
-        for _, candidate in ipairs(candidates) do
-            if candidate == photo or candidate:isMissing() then goto inner_continue end
-
-            local cTime = candidate:getRawMetadata("dateTimeOriginal")
-            local cCamera = candidate:getFormattedMetadata("cameraModel") or ""
-            local cWidth = candidate:getRawMetadata("width")
-            local cHeight = candidate:getRawMetadata("height")
-
-            if compareTimestamps(dateTime, cTime) then
-                if cCamera == camera and cWidth == width and cHeight == height then
-                    table.insert(matches, candidate:getRawMetadata("path"))
-                else
-                    table.insert(possibles, candidate:getRawMetadata("path"))
+                    if compareTimestamps(dateTime, cTime) then
+                        if cCamera == camera and cWidth == width and cHeight == height then
+                            table.insert(matches, candidate:getRawMetadata("path"))
+                        else
+                            table.insert(possibles, candidate:getRawMetadata("path"))
+                        end
+                    end
                 end
             end
 
-            ::inner_continue::
+            if #matches == 1 then
+                logToFile(relinkPath, "ln '" .. matches[1] .. "' '" .. photo:getRawMetadata("path") .. "'")
+            elseif #matches > 1 then
+                logToFile(ambiguousPath, photo:getRawMetadata("path") .. "," .. table.concat(matches, "; "))
+            elseif #possibles > 0 then
+                logToFile(possiblePath, photo:getRawMetadata("path") .. "\n  Possible matches:\n    " .. table.concat(possibles, "\n    "))
+            end
         end
-
-        if #matches == 1 then
-            logToFile(relinkPath, "ln '" .. matches[1] .. "' '" .. photo:getRawMetadata("path") .. "'")
-        elseif #matches > 1 then
-            logToFile(ambiguousPath, photo:getRawMetadata("path") .. "," .. table.concat(matches, "; "))
-        elseif #possibles > 0 then
-            logToFile(possiblePath, photo:getRawMetadata("path") .. "\n  Possible matches:\n    " .. table.concat(possibles, "\n    "))
-        end
-
-        ::continue::
     end
 
     LrDialogs.message("Match search complete.", "Results saved to Desktop:
