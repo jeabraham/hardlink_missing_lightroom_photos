@@ -27,20 +27,20 @@ See [DESIGN.md](DESIGN.md) for the full rationale, background, and planned futur
 Use Lightroom Classic's built-in **"Find All Missing Photos"** (Library menu) to
 populate the `Missing Photographs` smart collection.
 
-Then export the list using the
-**[Any Filter](https://www.johnrellis.com/lightroom/any-filter-readme.htm)**
-Lightroom plugin:
+Then export the list using this repository's Lightroom plugin:
 
 1. Select all photos in the `Missing Photographs` collection.
-2. In the Any Filter panel, use its **Sort/Export** function to export a CSV.
-3. Make sure the exported CSV includes at minimum the **full file path** column
-   (Any Filter calls this `Photo`).  Also include capture date/time, camera make,
-   width, and height if you plan to run the metadata-matching step later.
+2. Run **Library → Plug-in Extras → Write CSV File for Photos**.
+3. The plugin writes `Missing_Photos.csv` to your Desktop with the columns:
+   - `Photo`
+   - `URL`
+   - `Filename`
+   - `Date/Time Original (Capture)`
+   - `Width`
+   - `Height`
+   - `Camera Make`
 
 Save the file as `data/Missing_Photos.csv` (or pass a custom path to the scripts).
-
-> **Note:** No custom Lua code is needed to export the missing-photo list.
-> Any Filter's built-in export covers this step completely.
 
 ---
 
@@ -155,7 +155,8 @@ a restored copy or another candidate.
 ## Phase 2 — Find identical copies and hardlink them
 
 After recovering everything possible from Time Machine, re-run
-**Library → Find All Missing Photos** in Lightroom, then export a fresh CSV.
+**Library → Find All Missing Photos** in Lightroom, then export a fresh CSV
+using **Write CSV File for Photos**.
 
 Step 2a and 2b are **complementary tools**, not the same implementation in two
 languages:
@@ -258,7 +259,7 @@ additional disk space and without modifying the Lightroom catalog.
 | `pandas` | `relink_missing_photos.py` | `pip install pandas` |
 | `python-dateutil` | `relink_missing_photos.py` | `pip install python-dateutil` |
 | `exiftool` | `relink_missing_photos.py`, `compare_metadata.py` | `brew install exiftool` |
-| Any Filter plugin | Lightroom export step | [johnrellis.com](https://www.johnrellis.com/lightroom/any-filter-readme.htm) |
+| Lightroom plugin in this repo | Missing-photo CSV export and catalog candidate matching | Included (`FindLinkMatches.lrplugin`) |
 
 `recover_from_timemachine.py` uses only the Python standard library.
 
@@ -269,14 +270,15 @@ additional disk space and without modifying the Lightroom catalog.
 ```
 FindLinkMatches.lrplugin/   Lightroom plugin — find catalog matches for missing photos
   Info.lua                  Plugin metadata
-  main.lua                  Plugin logic
+  main.lua                  Step 2a: find catalog matches + link command suggestions
+  write_csv.lua             Step 1/2 input export: Missing_Photos.csv with metadata
 
 recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine
 relink_missing_photos.py    Phase 2: index filesystem + match by EXIF metadata
 compare_metadata.py         Manual metadata comparison helper
 
 data/
-  Missing_Photos.csv        Input: exported from Lightroom via Any Filter
+  Missing_Photos.csv        Input: exported from Lightroom via plugin CSV command
   timemachine_recovery_candidates.csv   Output of recover_from_timemachine scan
   restore_log.csv           Log of restore operations
 

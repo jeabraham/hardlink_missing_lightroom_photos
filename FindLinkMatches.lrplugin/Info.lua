@@ -9,6 +9,10 @@ return {
       title = "Find Matches to Missing Photos To Possibly Link",
       file = "main.lua",
     },
+    {
+      title = "Write CSV File for Photos",
+      file = "write_csv.lua",
+    },
   },
 
   VERSION = { major = 1, minor = 0, revision = 0, build = 1 },
