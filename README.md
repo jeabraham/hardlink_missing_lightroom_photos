@@ -157,6 +157,17 @@ a restored copy or another candidate.
 After recovering everything possible from Time Machine, re-run
 **Library → Find All Missing Photos** in Lightroom, then export a fresh CSV.
 
+Step 2a and 2b are **complementary tools**, not the same implementation in two
+languages:
+
+- **2a (Lua plugin)** queries Lightroom's active catalog directly.
+- **2b (Python script)** scans files under `/Volumes/Ladyhawke` and evaluates
+  EXIF on-disk via `exiftool`.
+
+Use 2a when you want fast catalog-internal candidate discovery from Lightroom.
+Use 2b when you want a broader filesystem pass and more explicit ranking/output
+files for review.
+
 ### Step 2a — Find candidates with the Lightroom plugin
 
 **Plugin:** `FindLinkMatches.lrplugin`  
@@ -195,6 +206,10 @@ python3 relink_missing_photos.py data/Missing_Photos.csv
 Indexes all files under `/Volumes/Ladyhawke` by filename stem, then matches each
 missing photo against candidates using `exiftool`-extracted EXIF data (timestamp,
 camera make, width, height).  Handles resolution mismatches separately.
+
+Unlike the plugin, this step is not limited to what Lightroom currently returns
+from catalog search and emits separate outputs for exact relinks, resolution
+mismatches, and still-missing records.
 
 Options:
 
