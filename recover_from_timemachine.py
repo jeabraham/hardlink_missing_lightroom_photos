@@ -478,12 +478,39 @@ def is_apfs_backup_path(backup_path: str) -> bool:
 # APFS-specific snapshot scanning (mount each snapshot once, check all files)
 # ---------------------------------------------------------------------------
 
+def _debug_snapshot_tree(mountpoint: Path, depth: int = 3) -> None:
+    """
+    Print the directory tree of a mounted snapshot up to ``depth`` levels deep.
+    Used to diagnose the actual path structure inside a Time Machine snapshot.
+    """
+    def _walk(path: Path, level: int) -> None:
+        if level > depth:
+            return
+        try:
+            entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
+        except PermissionError:
+            print(f"{'  ' * level}[permission denied]", file=sys.stderr)
+            return
+        for entry in entries[:30]:  # cap at 30 per directory to avoid flooding output
+            kind = "F" if entry.is_file() else "D"
+            print(f"{'  ' * level}[{kind}] {entry.name}", file=sys.stderr)
+            if entry.is_dir() and level < depth:
+                _walk(entry, level + 1)
+        if len(entries) > 30:
+            print(f"{'  ' * level}... ({len(entries) - 30} more entries)", file=sys.stderr)
+
+    print(f"\n  DEBUG: snapshot mounted at {mountpoint}", file=sys.stderr)
+    print(f"  DEBUG: directory tree (depth={depth}):", file=sys.stderr)
+    _walk(mountpoint, 1)
+
+
 def scan_apfs_snapshots(
     rel_paths: list[str],
     snapshots: list,
     tm_volume: Path,
     *,
     progress_callback=None,
+    debug: bool = False,
 ) -> dict:
     """
     For APFS Time Machine volumes, mount each snapshot once, check every
@@ -496,6 +523,7 @@ def scan_apfs_snapshots(
     ``(apfs_backup_path_str, date_str, file_size, mtime)`` tuples, newest-first.
     """
     results = {r: [] for r in rel_paths}
+    _debug_done = False  # only dump tree once
 
     for i, (snap_name, date_str) in enumerate(snapshots, 1):
         if progress_callback:
@@ -504,6 +532,26 @@ def scan_apfs_snapshots(
         try:
             with _mount_apfs_snapshot(snap_name, tm_volume) as mountpoint:
                 lh_root = mountpoint / "Ladyhawke"
+
+                if debug and not _debug_done:
+                    _debug_done = True
+                    _debug_snapshot_tree(mountpoint, depth=3)
+                    lh_exists = lh_root.exists()
+                    print(
+                        f"\n  DEBUG: mountpoint/Ladyhawke = {lh_root}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"  DEBUG: Ladyhawke subdir exists: {lh_exists}",
+                        file=sys.stderr,
+                    )
+                    for rel in rel_paths:
+                        print(
+                            f"  DEBUG: searching for: {lh_root / rel}",
+                            file=sys.stderr,
+                        )
+                    print("", file=sys.stderr)
+
                 for rel in rel_paths:
                     candidate = lh_root / rel
                     actual = _resolve_case_insensitive(candidate)
@@ -741,6 +789,7 @@ def cmd_scan(args):
                 snapshots_to_scan,
                 tm_volume,
                 progress_callback=_progress,
+                debug=args.debug,
             )
         else:
             apfs_results = {r: [] for r in unique_rels}
@@ -1214,6 +1263,15 @@ def build_parser():
         help=(
             "Month step used by --search-mode anchored (default: 1). "
             "Example: 1 probes every month, 2 probes every other month."
+        ),
+    )
+    p_scan.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Print the directory tree of the first mounted snapshot and the paths "
+            "being searched, to diagnose path-structure issues."
         ),
     )
     p_scan.set_defaults(func=cmd_scan)
