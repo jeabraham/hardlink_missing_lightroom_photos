@@ -213,8 +213,12 @@ local function checkForSameOrBetter()
                 debugLog(debugPath, "Candidate " .. tostring(candidateIndex) .. " of " .. tostring(#candidates) .. ": " .. candidateLabel)
                 setDebugCaption(progressScope, totalPhotos, "Candidate " .. tostring(candidateIndex) .. " of " .. tostring(#candidates) .. ": " .. candidateFileName)
 
+                local candidateStem = candidateFileName:match("(.+)%..+$") or candidateFileName
+
                 if candidate == photo then
                     debugLog(debugPath, "Skipping candidate: same Lightroom photo object as selected photo.")
+                elseif candidateStem:lower() ~= nameWithoutExt:lower() then
+                    debugLog(debugPath, "Skipping candidate: stem mismatch. expected=" .. nameWithoutExt .. ", got=" .. candidateStem)
                 elseif not isPhotoPresent(candidate, debugPath, "candidate " .. candidateLabel) then
                     debugLog(debugPath, "Skipping candidate: candidate is not available/present in catalog.")
                 else
