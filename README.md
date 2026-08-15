@@ -82,7 +82,7 @@ Save the file as `data/Missing_Photos.csv` (or pass a custom path to the scripts
 ## Phase 1 — Recover originals from Time Machine
 
 **Script:** `recover_from_timemachine.py`  
-**Status:** Implemented; not yet tested against the live backup volume.  
+**Status:** Implemented and tested against APFS snapshots from Time Machine and from Carbon Copy Cloner
 **Dependencies:** Python 3.9+, standard library only.
 
 ### inspect — discover the backup structure
@@ -196,7 +196,7 @@ using **Write CSV File for Photos**.
 ### Step 2a — Find candidates with Python
 
 **Script:** `relink_missing_photos.py`  
-**Status:** Implemented; not yet fully end-to-end tested.  
+**Status:** Implemented; tested in various scenarios, yet the restore functions (shell commands) have not yet been tested fully within Lightroom.  
 **Dependencies:** Python 3.9+, `pandas`, `python-dateutil`, `exiftool` (CLI tool).
 
 ```bash
@@ -324,7 +324,8 @@ FindLinkMatches.lrplugin/   Lightroom plugin — catalog-based tools for missing
   Info.lua                  Plugin metadata
   main.lua                  WIP: find catalog matches + link command suggestions (not yet working)
   check_same_or_better.lua  Step 0: add photos that have a same-or-better copy to a collection
-  write_csv.lua             Step 1/2 input export: Missing_Photos.csv with metadata
+  write_csv.lua             Step 1/2 input export: Writes all selected photos to Missing_Photos.csv with metadata
+  write_missing_csv.lua     Same as write_csv.lua but attempts to skip non-missing photos, not tested yet.
 
 recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine
 relink_missing_photos.py    Phase 2: index filesystem + match by EXIF metadata
@@ -335,13 +336,9 @@ data/
   timemachine_recovery_candidates.csv   Output of recover_from_timemachine scan
   restore_log.csv           Log of restore operations
 
-Still_Missing_Photos.csv    Photos with no match after Phase 2
-ambiguous_matches.csv       Photos with multiple conflicting candidates
-relink_good_matches.sh      Generated hardlink commands (review before running)
-resolution_mismatch.sh      Links where resolution differs; LR:WxH shown per entry; HIGHER_RESOLUTION tagged
-higher_resolution.sh        Auto-extracted subset of resolution_mismatch.sh for higher-res matches
-import_other_formats.csv    Cross-format candidates (e.g. RAW when LR has JPEG)
-import_same_format_higher_resolution.csv  Same-extension candidates with higher resolution
 setup.env                   pip install commands for Python dependencies
 DESIGN.md                   Full design rationale and planned future phases
+MISSING_LUA_VS_PYTHON.md    Describes the design advantages and disadvantages of the not-yet-functional lua version of link_missing_photos.py (main.lua)
+README.md                   This file
+requirements.txt            Python dependencies
 ```
