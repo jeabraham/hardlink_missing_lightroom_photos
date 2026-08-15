@@ -263,9 +263,6 @@ local function checkForSameOrBetter()
                     end
                 end
 
-                if DEBUG_VERBOSE then
-                    LrTasks.yield()
-                end
             end
 
             if foundSameOrBetter then
@@ -302,18 +299,7 @@ end
 
 local function runWithErrorLogging()
     local debugPath = LrPathUtils.child(desktop, "check_same_or_better_debug.log")
-
-    local ok, err = pcall(function()
-        checkForSameOrBetter()
-    end)
-
-    if not ok then
-        debugLog(debugPath, "FATAL ERROR: " .. tostring(err))
-        LrDialogs.message(
-            "Check failed.",
-            "A Lua error occurred. Details were written to:\n" .. debugPath .. "\n\n" .. tostring(err)
-        )
-    end
+    checkForSameOrBetter()
 end
 
 LrTasks.startAsyncTask(runWithErrorLogging)
