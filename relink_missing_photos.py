@@ -22,7 +22,7 @@ def get_exif_data_exiftool(image_path):
     try:
         result = subprocess.run(
             ["exiftool", "-Make", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", image_path],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, timeout=30
         )
         data = {}
         for line in result.stdout.strip().splitlines():
@@ -36,6 +36,9 @@ def get_exif_data_exiftool(image_path):
             "Height": int(data.get("Image Height", "0").replace(" pixels", "")),
             "DateTime": data.get("Date/Time Original", "")
         }
+    except subprocess.TimeoutExpired:
+        print(f"⚠️ exiftool timed out on {image_path}, skipping", file=sys.stderr)
+        return None
     except subprocess.CalledProcessError as e:
         print(f"❌ Error running exiftool on {image_path}: {e.stderr}", file=sys.stderr)
         return None
