@@ -30,7 +30,8 @@ local function compareTimestamps(t1, t2)
 end
 
 local function isPhotoMissing(photo)
-    return photo:getRawMetadata("isMissing") == true
+	local path = photo:getRawMetadata("path")
+	return path and not LrFileUtils.exists(path)
 end
 
 local function isPhotoPresent(photo)
