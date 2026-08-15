@@ -195,24 +195,21 @@ local function checkForSameOrBetter()
         setDebugCaption(progressScope, totalPhotos, "Searching catalog for filename containing: " .. nameWithoutExt)
         debugLog(debugPath, "Before catalog:findPhotos")
 
-        local okFind, candidates = pcall(function()
-            return catalog:findPhotos({
-                searchDesc = {
-                    {
-                        criteria = "filename",
-                        operation = "contains",
-                        value = nameWithoutExt,
-                        searchable = true
-                    }
+        local candidates = catalog:findPhotos({
+            searchDesc = {
+                {
+                    criteria = "filename",
+                    operation = "contains",
+                    value = nameWithoutExt,
+                    searchable = true
                 }
-            })
-        end)
+            }
+        })
 
-        debugLog(debugPath, "After catalog:findPhotos. ok=" .. tostring(okFind)
-            .. ", candidateCount=" .. tostring(candidates and #candidates or "nil"))
+        debugLog(debugPath, "After catalog:findPhotos. candidateCount=" .. tostring(candidates and #candidates or "nil"))
 
-        if not okFind or not candidates then
-            debugLog(debugPath, "Skipping photo because catalog search failed: " .. tostring(candidates))
+        if not candidates then
+            debugLog(debugPath, "Skipping photo because catalog search returned nil.")
             skippedCount = skippedCount + 1
         else
             local foundSameOrBetter = false
