@@ -265,10 +265,30 @@ The summary counts each input photo exactly once in its primary outcome category
 `Still missing`).  Alternate candidates and comment lines are counted separately so
 the total primary outcomes always equals the number of photos processed.
 
-### Step 2d — Gather recommended import files into one directory
+### Step 2d — Choose how to process recommendation CSV rows
 
-For rows in `import_other_formats.csv` and `import_same_format_higher_resolution.csv`,
-use this helper to gather each `new_file` into an import directory before using
+`import_other_formats.csv` and `import_same_format_higher_resolution.csv` are
+recommendation lists, not single all-or-nothing batches. You can inspect/edit them
+in Excel (or any CSV tool) and split rows into separate CSVs based on source path,
+source volume, file type, or your preferred import method.
+
+Example split:
+
+- `add_directly_in_place.csv`
+- `collect_these_to_import_with_lr_dialog.csv`
+
+You can use both workflows in the same project:
+
+- **Workflow 1: Gather + Lightroom Import dialog**  
+  Build an import directory of hardlinks (or optional cross-volume copies), then use
+  Lightroom's normal Import dialog and your usual import presets/settings.
+- **Workflow 2: Import directly in place**  
+  Lightroom catalogs each `new_file` exactly where it already lives on disk, with no
+  file movement/copy/rename.
+
+### Workflow 1 — Gather recommended files into one directory
+
+Use this helper to gather each `new_file` into an import directory before using
 Lightroom's normal Import dialog:
 
 ```bash
@@ -289,6 +309,27 @@ containing those remaining rows (all original columns preserved), by default:
 
 `<input_stem>_remaining_other_volume.csv`
 
+### Workflow 2 — Import files directly in place via Lightroom plug-in
+
+In Lightroom Classic, run:
+
+**Library → Plug-in Extras → Import photos from recovery CSV**
+
+What it does:
+
+- Prompts you to choose a CSV.
+- Reads the `new_file` column.
+- Normalizes and validates each path.
+- Skips blank paths.
+- Skips missing/unreadable paths.
+- Skips files already present in the catalog.
+- Imports remaining files in place using `catalog:addPhoto()` (no move/copy/rename).
+- Does not use `triggerImportUI()` (Lightroom SDK cannot preselect arbitrary files across many folders).
+- Adds successfully imported photos to collection **`new-files-imported`** (reuses it if it already exists).
+- Selects imported photos when practical.
+- Writes detailed failures (path + error) to `~/Desktop/import_recovery_csv_failures.log`.
+- Reports counts for imported / already present / missing-unreadable / failed.
+
 #### Interrupt and resume
 
 If the script is interrupted with Ctrl-C it flushes all output files and prints a
@@ -304,7 +345,7 @@ already written to the output files.
 > useful for other users, but **it does not work reliably yet**.  The Python script
 > (`relink_missing_photos.py`) is the currently recommended path.
 
-### Step 2b — Compare metadata for a specific file
+### Step 2e — Compare metadata for a specific file
 
 ```bash
 python3 compare_metadata.py data/Missing_Photos.csv <expected_filename> <candidate_path>
@@ -314,7 +355,7 @@ Loads metadata from the CSV for `<expected_filename>` and compares it against
 `<candidate_path>` using exiftool.  Useful for manually verifying a specific
 candidate before linking.
 
-### Step 2c — Apply the hardlinks
+### Step 2f — Apply the hardlinks
 
 Review `relink_good_matches.sh`, then run it:
 
@@ -350,10 +391,12 @@ FindLinkMatches.lrplugin/   Lightroom plugin — catalog-based tools for missing
   check_same_or_better.lua  Step 0: add photos that have a same-or-better copy to a collection
   write_csv.lua             Step 1/2 input export: Writes all selected photos to Missing_Photos.csv with metadata
   write_missing_csv.lua     Same as write_csv.lua but attempts to skip non-missing photos, not tested yet.
+  import_recovery_csv.lua   Workflow 2: import `new_file` rows directly in place into catalog + collection
 
 recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine
 relink_missing_photos.py    Phase 2: index filesystem + match by EXIF metadata
 compare_metadata.py         Manual metadata comparison helper
+gather_import_files.py      Workflow 1: gather `new_file` rows into an import directory via hardlink/copy
 
 data/
   Missing_Photos.csv        Input: exported from Lightroom via plugin CSV command

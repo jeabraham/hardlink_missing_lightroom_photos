@@ -21,6 +21,10 @@ return {
       title = "Write CSV File for Missing Photos",
       file = "write_missing_csv.lua",
     },
+    {
+      title = "Import photos from recovery CSV",
+      file = "import_recovery_csv.lua",
+    },
   },
 
   VERSION = { major = 1, minor = 0, revision = 0, build = 1 },
