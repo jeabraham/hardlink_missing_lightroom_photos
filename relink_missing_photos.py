@@ -231,11 +231,11 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     else:
         file_index = None  # candidates fetched per-stem via mdfind
 
-    relink_commands = []
     still_missing = []
-    resolution_mismatches = []
     import_other_formats = []
     import_same_format_higher_res = []
+    # Track whether we've written the CSV headers yet (True after first flush)
+    csv_headers_written = False
 
     # Separate counters for meaningful summary (each photo counted once in primary category)
     relink_best_count = 0
@@ -243,11 +243,63 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     resolution_match_count = 0
     resolution_alt_count = 0
     import_other_formats_primary_count = 0
+    higher_resolution_count = 0
+    still_missing_count = 0
 
     total = len(missing_photos_df)
     print(f"Processing {total} rows...\n", file=sys.stderr)
 
     last_completed_row = skip_rows  # absolute CSV data row of the last finished row
+
+    def flush_csv_outputs():
+        """Append buffered CSV rows to disk and clear the in-memory buffers."""
+        nonlocal still_missing, import_other_formats, import_same_format_higher_res, csv_headers_written
+
+        still_missing_df = pd.DataFrame(still_missing)
+        if not still_missing_df.empty:
+            if csv_headers_written and still_missing_path.exists():
+                still_missing_df.to_csv(still_missing_path, mode="a", index=False, header=False)
+            elif append_outputs and still_missing_path.exists():
+                still_missing_df.to_csv(still_missing_path, mode="a", index=False, header=False)
+            else:
+                still_missing_df.to_csv(still_missing_path, index=False)
+            still_missing = []
+
+        import_other_formats_df = pd.DataFrame(
+            import_other_formats,
+            columns=["missing_file", "new_file", "missing_width", "missing_height", "new_width", "new_height", "rank"],
+        )
+        if not import_other_formats_df.empty:
+            if csv_headers_written and import_other_formats_path.exists():
+                import_other_formats_df.to_csv(import_other_formats_path, mode="a", index=False, header=False)
+            elif append_outputs and import_other_formats_path.exists():
+                import_other_formats_df.to_csv(import_other_formats_path, mode="a", index=False, header=False)
+            else:
+                import_other_formats_df.to_csv(import_other_formats_path, index=False)
+            import_other_formats = []
+
+        import_same_format_higher_res_df = pd.DataFrame(
+            import_same_format_higher_res,
+            columns=["missing_file", "matched_file", "new_file",
+                     "lr_width", "lr_height",
+                     "matched_width", "matched_height",
+                     "new_width", "new_height", "rank"],
+        )
+        if not import_same_format_higher_res_df.empty:
+            if csv_headers_written and import_same_format_higher_res_path.exists():
+                import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, mode="a", index=False, header=False)
+            elif append_outputs and import_same_format_higher_res_path.exists():
+                import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, mode="a", index=False, header=False)
+            else:
+                import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, index=False)
+            import_same_format_higher_res = []
+
+        csv_headers_written = True
+
+    # Open .sh output files for streaming writes
+    relink_file = open_output(relink_path, append_outputs)
+    mismatch_file = open_output(mismatch_path, append_outputs)
+    higher_resolution_file = open_output(higher_resolution_path, append_outputs)
 
     try:
         for i, (_, row) in enumerate(missing_photos_df.iterrows(), 1):
@@ -272,6 +324,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 if debug:
                     print(f"  → no candidates found", file=sys.stderr)
                 still_missing.append(row)
+                still_missing_count += 1
                 last_completed_row = skip_rows + i
                 continue
 
@@ -279,6 +332,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 if debug:
                     print(f"  → missing metadata in CSV row (date/width/height)", file=sys.stderr)
                 still_missing.append(row)
+                still_missing_count += 1
                 last_completed_row = skip_rows + i
                 continue
 
@@ -287,6 +341,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 if debug:
                     print(f"  → could not parse target datetime: {row.get('Date/Time Original (Capture)')}", file=sys.stderr)
                 still_missing.append(row)
+                still_missing_count += 1
                 last_completed_row = skip_rows + i
                 continue
 
@@ -364,7 +419,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
 
             if len(exact_matches) == 1:
                 cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
-                relink_commands.append(cmd)
+                relink_file.write(cmd + "\n")
                 relink_best_count += 1
                 decision_made = True
                 # Check for same-extension candidates with higher resolution than the exact match
@@ -388,13 +443,11 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 sorted_matches = sorted(exact_matches, key=sort_key)
                 best = sorted_matches[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
-                relink_commands.append(
-                    f'# Selected best match from {len(sorted_matches)} candidates: {format_candidate_meta(best)}'
-                )
-                relink_commands.append(cmd)
+                relink_file.write(f'# Selected best match from {len(sorted_matches)} candidates: {format_candidate_meta(best)}\n')
+                relink_file.write(cmd + "\n")
                 relink_best_count += 1
                 for alt in sorted_matches[1:]:
-                    relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                    relink_file.write(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})\n')
                     relink_alt_count += 1
                 decision_made = True
                 # Check for same-extension candidates with higher resolution than the best exact match
@@ -418,15 +471,18 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 higher_res_tag = " HIGHER_RESOLUTION" if best['resolution'] > target_w * target_h else ""
-                resolution_mismatches.append(
-                    f'# Resolution mismatch{higher_res_tag} (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
-                )
-                resolution_mismatches.append(cmd)
+                comment = f'# Resolution mismatch{higher_res_tag} (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
+                mismatch_file.write(comment + "\n")
+                mismatch_file.write(cmd + "\n")
+                if higher_res_tag:
+                    higher_resolution_file.write(comment + "\n")
+                    higher_resolution_file.write(cmd + "\n")
+                    higher_resolution_count += 1
                 emitted_resolution_mismatch = True
                 resolution_match_count += 1
                 decision_made = True
                 for alt in same_type_sorted[1:]:
-                    resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                    mismatch_file.write(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})\n')
                     resolution_alt_count += 1
                 higher_res_other_formats = [
                     s for s in other_type_sorted
@@ -462,13 +518,16 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 higher_res_tag = " HIGHER_RESOLUTION" if best['resolution'] > target_w * target_h else ""
-                resolution_mismatches.append(
-                    f'# Resolution mismatch{higher_res_tag} (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
-                )
-                resolution_mismatches.append(cmd)
+                comment = f'# Resolution mismatch{higher_res_tag} (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
+                mismatch_file.write(comment + "\n")
+                mismatch_file.write(cmd + "\n")
+                if higher_res_tag:
+                    higher_resolution_file.write(comment + "\n")
+                    higher_resolution_file.write(cmd + "\n")
+                    higher_resolution_count += 1
                 resolution_match_count += 1
                 for alt in same_type_sorted[1:]:
-                    resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                    mismatch_file.write(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})\n')
                     resolution_alt_count += 1
                 decision_made = True
                 if debug:
@@ -477,82 +536,42 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 if debug:
                     print(f"  → no scored candidates passed filters", file=sys.stderr)
                 still_missing.append(row)
+                still_missing_count += 1
 
             last_completed_row = skip_rows + i
             if i % 100 == 0 or i == total:
                 print(f"Processed {i}/{total} rows...", file=sys.stderr)
+                relink_file.flush()
+                mismatch_file.flush()
+                higher_resolution_file.flush()
+                flush_csv_outputs()
 
     except KeyboardInterrupt:
+        relink_file.flush()
+        mismatch_file.flush()
+        higher_resolution_file.flush()
+        flush_csv_outputs()
         _print_interrupt_resume(csv_filename, last_completed_row, skip_rows,
                                 rows_to_process, output_dir, sys.argv)
         sys.exit(130)
+    finally:
+        relink_file.close()
+        mismatch_file.close()
+        higher_resolution_file.close()
 
-    # Write relink_good_matches.sh
-    with open_output(relink_path, append_outputs) as f:
-        for cmd in relink_commands:
-            f.write(cmd + "\n")
-
-    # Write resolution_mismatch.sh
-    with open_output(mismatch_path, append_outputs) as f:
-        for line in resolution_mismatches:
-            f.write(line + "\n")
-
-    # Write higher_resolution.sh by extracting HIGHER_RESOLUTION entries from resolution_mismatches
-    higher_resolution_lines = []
-    i = 0
-    while i < len(resolution_mismatches):
-        if 'HIGHER_RESOLUTION' in resolution_mismatches[i]:
-            higher_resolution_lines.append(resolution_mismatches[i])
-            if i + 1 < len(resolution_mismatches):
-                higher_resolution_lines.append(resolution_mismatches[i + 1])
-            i += 2
-        else:
-            i += 1
-    with open_output(higher_resolution_path, append_outputs) as f:
-        for line in higher_resolution_lines:
-            f.write(line + "\n")
-
-    # Write Still_Missing_Photos.csv
-    still_missing_df = pd.DataFrame(still_missing)
-    if append_outputs and still_missing_path.exists():
-        still_missing_df.to_csv(still_missing_path, mode="a", index=False, header=False)
-    else:
-        still_missing_df.to_csv(still_missing_path, index=False)
-
-    # Write import_other_formats.csv
-    import_other_formats_df = pd.DataFrame(
-        import_other_formats,
-        columns=["missing_file", "new_file", "missing_width", "missing_height", "new_width", "new_height", "rank"],
-    )
-    if append_outputs and import_other_formats_path.exists():
-        import_other_formats_df.to_csv(import_other_formats_path, mode="a", index=False, header=False)
-    else:
-        import_other_formats_df.to_csv(import_other_formats_path, index=False)
-
-    # Write import_same_format_higher_resolution.csv
-    import_same_format_higher_res_df = pd.DataFrame(
-        import_same_format_higher_res,
-        columns=["missing_file", "matched_file", "new_file",
-                 "lr_width", "lr_height",
-                 "matched_width", "matched_height",
-                 "new_width", "new_height", "rank"],
-    )
-    if append_outputs and import_same_format_higher_res_path.exists():
-        import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, mode="a", index=False, header=False)
-    else:
-        import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, index=False)
+    # Final flush for any remaining buffered CSV rows
+    flush_csv_outputs()
 
     print("\nSummary:", file=sys.stderr)
     print(f"  Relink commands (best):            {relink_best_count}", file=sys.stderr)
     print(f"  Relink commands (alternate):       {relink_alt_count}", file=sys.stderr)
     print(f"  Resolution mismatches (match):     {resolution_match_count}", file=sys.stderr)
     print(f"  Resolution mismatches (alternate): {resolution_alt_count}", file=sys.stderr)
-    higher_resolution_count = len(higher_resolution_lines) // 2
     print(f"  Higher resolution matches:         {higher_resolution_count}", file=sys.stderr)
-    print(f"  Import other formats:              {import_other_formats_primary_count} photos ({len(import_other_formats)} candidates)", file=sys.stderr)
-    print(f"  Import higher res same format:     {len(import_same_format_higher_res)}", file=sys.stderr)
-    print(f"  Still missing:                     {len(still_missing)}", file=sys.stderr)
-    total_primary = relink_best_count + resolution_match_count + import_other_formats_primary_count + len(still_missing)
+    print(f"  Import other formats:              {import_other_formats_primary_count} photos", file=sys.stderr)
+    print(f"  Import higher res same format:     (see {import_same_format_higher_res_path.name})", file=sys.stderr)
+    print(f"  Still missing:                     {still_missing_count}", file=sys.stderr)
+    total_primary = relink_best_count + resolution_match_count + import_other_formats_primary_count + still_missing_count
     print(f"  (Total primary outcomes: {total_primary} / {total})", file=sys.stderr)
     print(f"\nDone. Outputs written to: {out_dir}/")
 
