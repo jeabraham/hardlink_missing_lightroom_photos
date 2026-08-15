@@ -134,8 +134,8 @@ def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
 
 def sort_key(candidate):
-    # Prefer: exact tz, raw format, best camera match, then higher resolution (all else equal)
-    return (candidate['tz_adjusted'], -candidate['raw'], -candidate['camera_score'], -candidate['resolution'])
+    # Prefer: exact tz, raw format, best camera match, higher resolution, then same volume (hardlink over copy)
+    return (candidate['tz_adjusted'], -candidate['raw'], -candidate['camera_score'], -candidate['resolution'], not candidate['same_volume'])
 
 
 def format_candidate_meta(candidate):
@@ -392,7 +392,8 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                     'camera_score': 2 if _csv_camera and file_camera and _csv_camera == file_camera
                                     else 1 if _csv_camera in file_camera or file_camera in _csv_camera
                                     else 0,
-                    'resolution': meta['Width'] * meta['Height']
+                    'resolution': meta['Width'] * meta['Height'],
+                    'same_volume': get_volume(candidate) == get_volume(original_path)
                 }
 
             scored = list(filter(None, (score(c) for c in candidates)))
