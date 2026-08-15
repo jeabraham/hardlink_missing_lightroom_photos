@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-recover_from_timemachine.py — Phase 1 Time Machine recovery for Lightroom missing photos.
+recover_from_timemachine.py — Phase 1 Time Machine / CCC snapshot recovery for Lightroom missing photos.
 
 Commands:
-  inspect   <tm_volume>            — Discover and report Time Machine layout.
-  scan      <csv> <tm_volume>      — Find missing Ladyhawke originals in Time Machine.
+  inspect   <tm_volume>            — Discover and report Time Machine / CCC snapshot layout.
+  scan      <csv> <tm_volume>      — Find missing Ladyhawke originals in snapshots.
   restore   --report <csv>         — Copy found originals back (dry-run by default).
+
+Supports two kinds of APFS snapshots on the same volume:
+  * Apple Time Machine  (com.apple.TimeMachine.YYYY-MM-DD-HHmmss.backup)
+  * Carbon Copy Cloner  (com.bombich.ccc.<UUID>.YYYY-MM-DD-HHmmss)
 
 Examples:
   python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
+  python3 recover_from_timemachine.py inspect /Volumes/Catbus
   python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --dry-run
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --execute
 """
@@ -57,10 +63,18 @@ STATUS_OTHER = "NON_LADYHAWKE_PATH"
 # Time Machine discovery
 # ---------------------------------------------------------------------------
 
-# Regex to extract the datetime portion from an APFS TM snapshot name.
+# Regex to extract the datetime portion from an APFS Time Machine snapshot name.
 # e.g. "com.apple.TimeMachine.2022-11-10-152833.backup" → "2022-11-10-152833"
 _APFS_SNAP_DATE_RE = re.compile(
     r"com\.apple\.TimeMachine\.(\d{4}-\d{2}-\d{2}-\d{6})\.backup"
+)
+
+# Regex to extract the datetime portion from an APFS Carbon Copy Cloner snapshot name.
+# e.g. "com.bombich.ccc.E4BFE824-8455-4245-9097-01C6297359E6.2025-09-10-045738"
+#        → "2025-09-10-045738"
+_CCC_SNAP_DATE_RE = re.compile(
+    r"com\.bombich\.ccc\.[0-9A-F-]+\.(\d{4}-\d{2}-\d{2}-\d{6})",
+    re.IGNORECASE,
 )
 
 
@@ -69,10 +83,11 @@ def _list_apfs_snapshots(tm_volume: Path) -> list[dict]:
     Run ``diskutil apfs listsnapshots <volume>`` and parse the output.
 
     Returns a list of dicts with keys:
-      uuid  — snapshot UUID
-      name  — full snapshot name (e.g. "com.apple.TimeMachine.2022-11-10-152833.backup")
-      date  — extracted date string (e.g. "2022-11-10-152833"), or the full name if
-              the pattern doesn't match
+      uuid    — snapshot UUID
+      name    — full snapshot name
+      date    — extracted date string (e.g. "2022-11-10-152833"), or the full name if
+                the pattern doesn't match
+      source  — "timemachine" | "ccc" | "other"
     Ordered as reported by diskutil (oldest-first in practice).
     """
     try:
@@ -100,9 +115,23 @@ def _list_apfs_snapshots(tm_volume: Path) -> list[dict]:
         name_m = re.search(r"Name:\s+(.+)", line)
         if name_m and current_uuid:
             current_name = name_m.group(1).strip()
-            date_m = _APFS_SNAP_DATE_RE.search(current_name)
-            date = date_m.group(1) if date_m else current_name
-            snapshots.append({"uuid": current_uuid, "name": current_name, "date": date})
+            tm_m = _APFS_SNAP_DATE_RE.search(current_name)
+            ccc_m = _CCC_SNAP_DATE_RE.search(current_name)
+            if tm_m:
+                date = tm_m.group(1)
+                source = "timemachine"
+            elif ccc_m:
+                date = ccc_m.group(1)
+                source = "ccc"
+            else:
+                date = current_name
+                source = "other"
+            snapshots.append({
+                "uuid": current_uuid,
+                "name": current_name,
+                "date": date,
+                "source": source,
+            })
             current_uuid = None
             current_name = None
 
@@ -169,12 +198,15 @@ def discover_tm_layout(tm_volume: Path) -> dict:
 
     # --- Try APFS snapshot layout first ---
     apfs_snaps = _list_apfs_snapshots(tm_volume)
-    tm_snaps = [s for s in apfs_snaps if "TimeMachine" in s["name"]]
-    if tm_snaps:
+    tm_snaps = [s for s in apfs_snaps if s["source"] == "timemachine"]
+    ccc_snaps = [s for s in apfs_snaps if s["source"] == "ccc"]
+    known_snaps = tm_snaps + ccc_snaps
+    if known_snaps:
         result["layout_type"] = "apfs"
-        result["apfs_snapshots"] = tm_snaps
+        result["apfs_snapshots"] = known_snaps
         result["raw_notes"].append(
-            f"APFS volume: {len(tm_snaps)} Time Machine snapshots found "
+            f"APFS volume: {len(tm_snaps)} Time Machine snapshot(s) and "
+            f"{len(ccc_snaps)} Carbon Copy Cloner snapshot(s) found "
             f"(out of {len(apfs_snaps)} total APFS snapshots)."
         )
         return result
@@ -480,24 +512,36 @@ def is_apfs_backup_path(backup_path: str) -> bool:
 
 def _find_ladyhawke_in_snapshot(mountpoint: Path) -> Path | None:
     """
-    Locate the ``Ladyhawke`` directory inside a mounted APFS Time Machine snapshot.
+    Locate the ``Ladyhawke`` directory inside a mounted APFS snapshot.
 
-    On this backup volume the structure is::
+    Two layouts are supported:
+
+    **Time Machine** — the snapshot contains a dated backup directory::
 
         <mountpoint>/
             <dated-backup-dir>.backup/
                 Ladyhawke/          ← what we want
                 Data/
-                Homes/
                 ...
-            backup_manifest.plist
+
+    **Carbon Copy Cloner** — the snapshot is a direct clone of the source
+    volume, so ``Ladyhawke`` (or any other volume-level directory) sits
+    directly under the mountpoint::
+
+        <mountpoint>/
+            Ladyhawke/              ← what we want
+            RawPhotos/
             ...
 
-    The function scans the top-level non-hidden directories of ``mountpoint``
-    for a subdirectory named ``Ladyhawke`` (case-insensitive), returning the
-    first match.  Falls back to ``mountpoint / "Ladyhawke"`` if nothing is
-    found one level deeper.
+    The function tries the CCC (direct) layout first, then falls back to
+    probing one level deeper for the Time Machine layout.
     """
+    # --- CCC / direct-clone layout: Ladyhawke immediately under mountpoint ---
+    direct = mountpoint / "Ladyhawke"
+    if direct.is_dir():
+        return direct
+
+    # --- Time Machine layout: scan one level deeper ---
     try:
         top_entries = [
             e for e in mountpoint.iterdir()
@@ -513,11 +557,6 @@ def _find_ladyhawke_in_snapshot(mountpoint: Path) -> Path | None:
                     return sub
         except OSError:
             continue
-
-    # Last resort: check directly under mountpoint (older layout).
-    direct = mountpoint / "Ladyhawke"
-    if direct.is_dir():
-        return direct
 
     return None
 
@@ -643,19 +682,26 @@ def cmd_inspect(args):
 
     if layout["layout_type"] == "apfs":
         snaps = layout.get("apfs_snapshots", [])
-        print(f"\nAPFS Time Machine snapshots: {len(snaps)} total")
+        tm_count = sum(1 for s in snaps if s.get("source") == "timemachine")
+        ccc_count = sum(1 for s in snaps if s.get("source") == "ccc")
+        print(
+            f"\nAPFS snapshots: {len(snaps)} total  "
+            f"({tm_count} Time Machine, {ccc_count} Carbon Copy Cloner)"
+        )
         if snaps:
             # Show a few oldest and newest; snapshots are newest-first after sorting
             sorted_snaps = sorted(snaps, key=lambda s: s["date"], reverse=True)
             display = sorted_snaps[:3]
             tail = sorted_snaps[-3:] if len(sorted_snaps) > 6 else []
             for s in display:
-                print(f"  {s['date']}  {s['name']}")
+                label = {"timemachine": "TM ", "ccc": "CCC"}.get(s.get("source", ""), "   ")
+                print(f"  [{label}] {s['date']}  {s['name']}")
             if len(sorted_snaps) > 6:
                 print(f"  ... ({len(sorted_snaps) - 6} more) ...")
             for s in tail:
                 if s not in display:
-                    print(f"  {s['date']}  {s['name']}")
+                    label = {"timemachine": "TM ", "ccc": "CCC"}.get(s.get("source", ""), "   ")
+                    print(f"  [{label}] {s['date']}  {s['name']}")
             print(f"\n  Newest: {sorted_snaps[0]['date']}")
             print(f"  Oldest: {sorted_snaps[-1]['date']}")
         print(
@@ -718,15 +764,15 @@ def cmd_scan(args):
     missing = load_missing_photos(csv_path)
     print(f"  {len(missing)} records loaded.", file=sys.stderr)
 
-    print(f"Discovering Time Machine layout on {tm_volume}...", file=sys.stderr)
+    print(f"Discovering snapshot layout on {tm_volume}...", file=sys.stderr)
     layout = discover_tm_layout(tm_volume)
     is_apfs = layout["layout_type"] == "apfs"
     snapshots = all_ladyhawke_snapshots(layout)
     print(f"  Layout type: {layout['layout_type']}", file=sys.stderr)
-    print(f"  {len(snapshots)} Time Machine snapshots found.", file=sys.stderr)
+    print(f"  {len(snapshots)} snapshots found.", file=sys.stderr)
     if not snapshots:
         print(
-            "WARNING: No Time Machine snapshots found. "
+            "WARNING: No snapshots found. "
             "Every record will be classified NOT_FOUND_IN_TIME_MACHINE.",
             file=sys.stderr,
         )
@@ -1268,7 +1314,10 @@ def cmd_hash(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Recover Lightroom Classic missing originals from a Time Machine backup.",
+        description=(
+            "Recover Lightroom Classic missing originals from a Time Machine "
+            "or Carbon Copy Cloner (CCC) APFS snapshot backup."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1276,24 +1325,24 @@ def build_parser():
 
     # inspect
     p_inspect = sub.add_parser(
-        "inspect", help="Discover and report Time Machine layout."
+        "inspect", help="Discover and report Time Machine / CCC snapshot layout."
     )
     p_inspect.add_argument(
         "tm_volume",
-        help="Path to mounted Time Machine volume (e.g. /Volumes/iMacBackup3).",
+        help="Path to mounted backup volume (e.g. /Volumes/iMacBackup3 or /Volumes/Catbus).",
     )
     p_inspect.set_defaults(func=cmd_inspect)
 
     # scan
     p_scan = sub.add_parser(
-        "scan", help="Search Time Machine for missing Lightroom originals."
+        "scan", help="Search Time Machine / CCC snapshots for missing Lightroom originals."
     )
     p_scan.add_argument(
         "csv", help="Path to Lightroom missing-photos CSV (must have a 'Photo' column)."
     )
     p_scan.add_argument(
         "tm_volume",
-        help="Path to mounted Time Machine volume (e.g. /Volumes/iMacBackup3).",
+        help="Path to mounted backup volume (e.g. /Volumes/iMacBackup3 or /Volumes/Catbus).",
     )
     p_scan.add_argument(
         "--output",
