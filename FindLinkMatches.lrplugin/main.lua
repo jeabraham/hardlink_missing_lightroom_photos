@@ -139,12 +139,9 @@ local function findAndCompareMissingPhotos()
 
             local candidates = catalog:findPhotos({
                 searchDesc = {
-                    {
-                        criteria = "filename",
-                        operation = "contains",
-                        value = nameWithoutExt,
-                        searchable = true
-                    }
+                    criteria = "filename",
+                    operation = "contains",
+                    value = nameWithoutExt,
                 }
             })
 
