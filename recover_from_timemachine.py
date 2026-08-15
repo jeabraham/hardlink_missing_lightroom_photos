@@ -3,9 +3,12 @@
 recover_from_timemachine.py — Phase 1 Time Machine / CCC snapshot recovery for Lightroom missing photos.
 
 Commands:
-  inspect   <tm_volume>            — Discover and report Time Machine / CCC snapshot layout.
-  scan      <csv> <tm_volume>      — Find missing Ladyhawke originals in snapshots.
-  restore   --report <csv>         — Copy found originals back (dry-run by default).
+  inspect   <tm_volume> [--source-volume <name-or-path>]
+                                   — Discover and report Time Machine / CCC snapshot layout.
+  scan      <csv> <tm_volume> --source-volume <name-or-path>
+                                   — Find missing originals in snapshots for the given source volume.
+  restore   --report <csv> [--source-volume <name-or-path>] [--execute]
+                                   — Copy found originals back (dry-run by default).
 
 Supports two kinds of APFS snapshots on the same volume:
   * Apple Time Machine  (com.apple.TimeMachine.YYYY-MM-DD-HHmmss.backup)
@@ -13,11 +16,12 @@ Supports two kinds of APFS snapshots on the same volume:
 
 Examples:
   python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
-  python3 recover_from_timemachine.py inspect /Volumes/Catbus
-  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3
-  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus --source-volume Ladyhawke
+  python3 recover_from_timemachine.py inspect /Volumes/Catbus --source-volume /Volumes/Ladyhawke
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3 --source-volume /Volumes/Ladyhawke
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus --source-volume /Volumes/Photos
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --dry-run
-  python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --execute
+  python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --source-volume /Volumes/Ladyhawke --execute
 """
 
 import argparse
@@ -333,6 +337,26 @@ def relative_volume_path(expected_path: str, source_volume: str) -> str | None:
         return str(Path(expected_path).relative_to(source_volume))
     except ValueError:
         return None
+
+
+def normalize_source_volume(source_volume: str | None) -> str | None:
+    """
+    Normalize ``--source-volume`` so ``Ladyhawke`` and ``/Volumes/Ladyhawke``
+    refer to the same source volume.
+    """
+    if not source_volume:
+        return None
+
+    path = Path(source_volume).expanduser()
+    parts = path.parts
+
+    if path.is_absolute():
+        return str(path)
+
+    if parts and parts[0] == "Volumes":
+        return str(Path("/") / path)
+
+    return str(Path("/Volumes") / path)
 
 
 def find_in_snapshots(rel_path: str, snapshots: list) -> list:
@@ -671,7 +695,7 @@ def cmd_inspect(args):
         print(f"ERROR: Time Machine volume not found: {tm_volume}", file=sys.stderr)
         sys.exit(1)
 
-    source_volume = args.source_volume
+    source_volume = normalize_source_volume(args.source_volume)
     volume_name = Path(source_volume).name if source_volume else None
 
     print(f"\n=== Inspecting Time Machine volume: {tm_volume} ===\n")
@@ -763,7 +787,7 @@ def cmd_inspect(args):
 def cmd_scan(args):
     csv_path = Path(args.csv)
     tm_volume = Path(args.tm_volume)
-    source_volume = str(Path(args.source_volume))
+    source_volume = normalize_source_volume(args.source_volume)
     volume_name = Path(source_volume).name
 
     if not csv_path.exists():
@@ -1378,8 +1402,8 @@ def build_parser():
         "--source-volume",
         default=None,
         help=(
-            "Path to the source volume whose backups you want to check "
-            "(e.g. /Volumes/Ladyhawke or /Volumes/Photos).  "
+            "Source volume whose backups you want to check, as either a volume name "
+            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke).  "
             "When provided, each snapshot is checked for the presence of that volume directory."
         ),
     )
@@ -1400,8 +1424,8 @@ def build_parser():
         "--source-volume",
         required=True,
         help=(
-            "Path to the source volume that was backed up "
-            "(e.g. /Volumes/Ladyhawke or /Volumes/Photos).  "
+            "Source volume that was backed up, as either a volume name "
+            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke).  "
             "Used to strip the volume prefix and locate the backup directory inside snapshots."
         ),
     )
@@ -1452,7 +1476,8 @@ def build_parser():
         "--source-volume",
         default=None,
         help=(
-            "Path to the original source volume (e.g. /Volumes/Ladyhawke or /Volumes/Photos).  "
+            "Original source volume, as either a volume name or full path "
+            "(e.g. Ladyhawke or /Volumes/Ladyhawke).  "
             "If omitted, inferred from the expected_path column in the report CSV."
         ),
     )
