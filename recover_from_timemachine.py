@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-recover_from_timemachine.py — Phase 1 Time Machine recovery for Lightroom missing photos.
+recover_from_timemachine.py — Phase 1 Time Machine / CCC snapshot recovery for Lightroom missing photos.
 
 Commands:
-  inspect   <tm_volume>            — Discover and report Time Machine layout.
-  scan      <csv> <tm_volume>      — Find missing Ladyhawke originals in Time Machine.
-  restore   --report <csv>         — Copy found originals back (dry-run by default).
+  inspect   <tm_volume> [--source-volume <name-or-path>]
+                                   — Discover and report Time Machine / CCC snapshot layout.
+  scan      <csv> <tm_volume> --source-volume <name-or-path>
+                                   — Find missing originals in snapshots for the given source volume.
+  restore   --report <csv> [--source-volume <name-or-path>] [--execute]
+                                   — Copy found originals back (dry-run by default).
+
+Supports two kinds of APFS snapshots on the same volume:
+  * Apple Time Machine  (com.apple.TimeMachine.YYYY-MM-DD-HHmmss.backup)
+  * Carbon Copy Cloner  (com.bombich.ccc.<UUID>.YYYY-MM-DD-HHmmss)
 
 Examples:
   python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
-  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus --source-volume Ladyhawke
+  python3 recover_from_timemachine.py inspect /Volumes/Catbus --source-volume /Volumes/Ladyhawke
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3 --source-volume /Volumes/Ladyhawke
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus --source-volume /Volumes/Photos
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --dry-run
-  python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --execute
+  python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --source-volume /Volumes/Ladyhawke --execute
 """
 
 import argparse
@@ -32,7 +42,6 @@ from pathlib import Path
 # Constants
 # ---------------------------------------------------------------------------
 
-LADYHAWKE_VOLUME = "/Volumes/Ladyhawke"
 DEFAULT_REPORT = "data/timemachine_recovery_candidates.csv"
 
 REPORT_COLUMNS = [
@@ -50,17 +59,25 @@ STATUS_FOUND = "FOUND_IN_TIME_MACHINE"
 STATUS_MULTIPLE = "MULTIPLE_TIME_MACHINE_VERSIONS"
 STATUS_NOT_FOUND = "NOT_FOUND_IN_TIME_MACHINE"
 STATUS_PRESENT = "CURRENTLY_PRESENT"
-STATUS_OTHER = "NON_LADYHAWKE_PATH"
+STATUS_OTHER = "NON_SOURCE_VOLUME_PATH"
 
 
 # ---------------------------------------------------------------------------
 # Time Machine discovery
 # ---------------------------------------------------------------------------
 
-# Regex to extract the datetime portion from an APFS TM snapshot name.
+# Regex to extract the datetime portion from an APFS Time Machine snapshot name.
 # e.g. "com.apple.TimeMachine.2022-11-10-152833.backup" → "2022-11-10-152833"
 _APFS_SNAP_DATE_RE = re.compile(
     r"com\.apple\.TimeMachine\.(\d{4}-\d{2}-\d{2}-\d{6})\.backup"
+)
+
+# Regex to extract the datetime portion from an APFS Carbon Copy Cloner snapshot name.
+# e.g. "com.bombich.ccc.E4BFE824-8455-4245-9097-01C6297359E6.2025-09-10-045738"
+#        → "2025-09-10-045738"
+_CCC_SNAP_DATE_RE = re.compile(
+    r"com\.bombich\.ccc\.[0-9A-F-]+\.(\d{4}-\d{2}-\d{2}-\d{6})",
+    re.IGNORECASE,
 )
 
 
@@ -69,10 +86,11 @@ def _list_apfs_snapshots(tm_volume: Path) -> list[dict]:
     Run ``diskutil apfs listsnapshots <volume>`` and parse the output.
 
     Returns a list of dicts with keys:
-      uuid  — snapshot UUID
-      name  — full snapshot name (e.g. "com.apple.TimeMachine.2022-11-10-152833.backup")
-      date  — extracted date string (e.g. "2022-11-10-152833"), or the full name if
-              the pattern doesn't match
+      uuid    — snapshot UUID
+      name    — full snapshot name
+      date    — extracted date string (e.g. "2022-11-10-152833"), or the full name if
+                the pattern doesn't match
+      source  — "timemachine" | "ccc" | "other"
     Ordered as reported by diskutil (oldest-first in practice).
     """
     try:
@@ -100,9 +118,23 @@ def _list_apfs_snapshots(tm_volume: Path) -> list[dict]:
         name_m = re.search(r"Name:\s+(.+)", line)
         if name_m and current_uuid:
             current_name = name_m.group(1).strip()
-            date_m = _APFS_SNAP_DATE_RE.search(current_name)
-            date = date_m.group(1) if date_m else current_name
-            snapshots.append({"uuid": current_uuid, "name": current_name, "date": date})
+            tm_m = _APFS_SNAP_DATE_RE.search(current_name)
+            ccc_m = _CCC_SNAP_DATE_RE.search(current_name)
+            if tm_m:
+                date = tm_m.group(1)
+                source = "timemachine"
+            elif ccc_m:
+                date = ccc_m.group(1)
+                source = "ccc"
+            else:
+                date = current_name
+                source = "other"
+            snapshots.append({
+                "uuid": current_uuid,
+                "name": current_name,
+                "date": date,
+                "source": source,
+            })
             current_uuid = None
             current_name = None
 
@@ -139,7 +171,7 @@ def _mount_apfs_snapshot(snapshot_name: str, tm_volume: Path):
             )
 
 
-def discover_tm_layout(tm_volume: Path) -> dict:
+def discover_tm_layout(tm_volume: Path, volume_name: str) -> dict:
     """
     Inspect a mounted Time Machine volume and return a dict describing its
     layout.  Handles three cases:
@@ -151,30 +183,33 @@ def discover_tm_layout(tm_volume: Path) -> dict:
       * ``unknown``— Neither structure found.
 
     Returns a dict with:
-      layout_type:      "apfs" | "modern" | "unknown"
-      apfs_snapshots:   [{"uuid": …, "name": …, "date": …}]  (apfs only)
-      hosts:            [str, …]            (modern only)
-      snapshots:        {host: [Path]}      (modern only)
-      ladyhawke_roots:  [Path]              (modern only; one per host)
-      raw_notes:        [str, …]
+      layout_type:    "apfs" | "modern" | "unknown"
+      apfs_snapshots: [{"uuid": …, "name": …, "date": …}]  (apfs only)
+      hosts:          [str, …]            (modern only)
+      snapshots:      {host: [Path]}      (modern only)
+      volume_roots:   [Path]              (modern only; one per host)
+      raw_notes:      [str, …]
     """
     result = {
         "layout_type": "unknown",
         "apfs_snapshots": [],
         "hosts": [],
         "snapshots": {},
-        "ladyhawke_roots": [],
+        "volume_roots": [],
         "raw_notes": [],
     }
 
     # --- Try APFS snapshot layout first ---
     apfs_snaps = _list_apfs_snapshots(tm_volume)
-    tm_snaps = [s for s in apfs_snaps if "TimeMachine" in s["name"]]
-    if tm_snaps:
+    tm_snaps = [s for s in apfs_snaps if s["source"] == "timemachine"]
+    ccc_snaps = [s for s in apfs_snaps if s["source"] == "ccc"]
+    known_snaps = tm_snaps + ccc_snaps
+    if known_snaps:
         result["layout_type"] = "apfs"
-        result["apfs_snapshots"] = tm_snaps
+        result["apfs_snapshots"] = known_snaps
         result["raw_notes"].append(
-            f"APFS volume: {len(tm_snaps)} Time Machine snapshots found "
+            f"APFS volume: {len(tm_snaps)} Time Machine snapshot(s) and "
+            f"{len(ccc_snaps)} Carbon Copy Cloner snapshot(s) found "
             f"(out of {len(apfs_snaps)} total APFS snapshots)."
         )
         return result
@@ -207,11 +242,11 @@ def discover_tm_layout(tm_volume: Path) -> dict:
                 snap_dirs = []
             result["snapshots"][host] = snap_dirs
 
-            # Look for Ladyhawke-related volume dirs inside each snapshot.
+            # Look for the source volume directory inside each snapshot.
             for snap_dir in snap_dirs:
-                candidate = snap_dir / "Ladyhawke"
+                candidate = snap_dir / volume_name
                 if candidate.is_dir():
-                    result["ladyhawke_roots"].append(candidate)
+                    result["volume_roots"].append(candidate)
                     break  # one representative is enough for listing
     else:
         result["raw_notes"].append(
@@ -219,26 +254,26 @@ def discover_tm_layout(tm_volume: Path) -> dict:
             "Volume may use an unsupported layout or may not be a Time Machine volume."
         )
 
-    # Deduplicate Ladyhawke roots while preserving first-seen order
+    # Deduplicate volume roots while preserving first-seen order
     seen = set()
     deduped = []
-    for p in result["ladyhawke_roots"]:
+    for p in result["volume_roots"]:
         key = str(p)
         if key not in seen:
             seen.add(key)
             deduped.append(p)
-    result["ladyhawke_roots"] = deduped
+    result["volume_roots"] = deduped
 
     return result
 
 
-def all_ladyhawke_snapshots(layout: dict) -> list:
+def all_volume_snapshots(layout: dict, volume_name: str) -> list:
     """
     Return a list of ``(snapshot_ref, date_str)`` tuples, newest-first, for
-    every snapshot that (for modern layout) contains a Ladyhawke volume
+    every snapshot that (for modern layout) contains the source volume
     directory, or (for APFS layout) every Time Machine snapshot on the volume.
 
-    For ``modern`` layout the snapshot_ref is a ``Path`` (the Ladyhawke root
+    For ``modern`` layout the snapshot_ref is a ``Path`` (the source volume root
     inside the snapshot directory).
 
     For ``apfs`` layout the snapshot_ref is the snapshot **name** string
@@ -256,7 +291,7 @@ def all_ladyhawke_snapshots(layout: dict) -> list:
     results = []
     for host, snap_dirs in layout.get("snapshots", {}).items():
         for snap_dir in snap_dirs:
-            lh = snap_dir / "Ladyhawke"
+            lh = snap_dir / volume_name
             if lh.is_dir():
                 results.append((lh, snap_dir.name))
     results.sort(key=lambda t: t[1], reverse=True)
@@ -292,16 +327,36 @@ def load_missing_photos(csv_path: Path) -> list:
 # Matching logic
 # ---------------------------------------------------------------------------
 
-def relative_ladyhawke_path(expected_path: str) -> str | None:
+def relative_volume_path(expected_path: str, source_volume: str) -> str | None:
     """
     Given a full expected path such as /Volumes/Ladyhawke/RawPhotos/foo/bar.NEF,
     return the relative portion (RawPhotos/foo/bar.NEF).
-    Returns None if the path is not under /Volumes/Ladyhawke.
+    Returns None if the path is not under the source volume (e.g. /Volumes/Ladyhawke).
     """
     try:
-        return str(Path(expected_path).relative_to(LADYHAWKE_VOLUME))
+        return str(Path(expected_path).relative_to(source_volume))
     except ValueError:
         return None
+
+
+def normalize_source_volume(source_volume: str | None) -> str | None:
+    """
+    Normalize ``--source-volume`` so ``Ladyhawke`` and ``/Volumes/Ladyhawke``
+    refer to the same source volume.
+    """
+    if not source_volume:
+        return None
+
+    path = Path(source_volume).expanduser()
+    parts = path.parts
+
+    if path.is_absolute():
+        return str(path)
+
+    if parts and parts[0] == "Volumes":
+        return str(Path("/") / path)
+
+    return str(Path("/Volumes") / path)
 
 
 def find_in_snapshots(rel_path: str, snapshots: list) -> list:
@@ -478,26 +533,38 @@ def is_apfs_backup_path(backup_path: str) -> bool:
 # APFS-specific snapshot scanning (mount each snapshot once, check all files)
 # ---------------------------------------------------------------------------
 
-def _find_ladyhawke_in_snapshot(mountpoint: Path) -> Path | None:
+def _find_source_volume_in_snapshot(mountpoint: Path, volume_name: str) -> Path | None:
     """
-    Locate the ``Ladyhawke`` directory inside a mounted APFS Time Machine snapshot.
+    Locate the source volume directory (e.g. ``Ladyhawke``) inside a mounted APFS snapshot.
 
-    On this backup volume the structure is::
+    Two layouts are supported:
+
+    **Time Machine** — the snapshot contains a dated backup directory::
 
         <mountpoint>/
             <dated-backup-dir>.backup/
                 Ladyhawke/          ← what we want
                 Data/
-                Homes/
                 ...
-            backup_manifest.plist
+
+    **Carbon Copy Cloner** — the snapshot is a direct clone of the source
+    volume, so ``Ladyhawke`` (or any other volume-level directory) sits
+    directly under the mountpoint::
+
+        <mountpoint>/
+            Ladyhawke/              ← what we want
+            RawPhotos/
             ...
 
-    The function scans the top-level non-hidden directories of ``mountpoint``
-    for a subdirectory named ``Ladyhawke`` (case-insensitive), returning the
-    first match.  Falls back to ``mountpoint / "Ladyhawke"`` if nothing is
-    found one level deeper.
+    The function tries the CCC (direct) layout first, then falls back to
+    probing one level deeper for the Time Machine layout.
     """
+    # --- CCC / direct-clone layout: source volume immediately under mountpoint ---
+    direct = mountpoint / volume_name
+    if direct.is_dir():
+        return direct
+
+    # --- Time Machine layout: scan one level deeper ---
     try:
         top_entries = [
             e for e in mountpoint.iterdir()
@@ -509,15 +576,10 @@ def _find_ladyhawke_in_snapshot(mountpoint: Path) -> Path | None:
     for top_dir in sorted(top_entries):
         try:
             for sub in top_dir.iterdir():
-                if sub.is_dir() and sub.name.lower() == "ladyhawke":
+                if sub.is_dir() and sub.name.lower() == volume_name.lower():
                     return sub
         except OSError:
             continue
-
-    # Last resort: check directly under mountpoint (older layout).
-    direct = mountpoint / "Ladyhawke"
-    if direct.is_dir():
-        return direct
 
     return None
 
@@ -552,16 +614,17 @@ def scan_apfs_snapshots(
     rel_paths: list[str],
     snapshots: list,
     tm_volume: Path,
+    volume_name: str,
     *,
     progress_callback=None,
     debug: bool = False,
 ) -> dict:
     """
     For APFS Time Machine volumes, mount each snapshot once, check every
-    ``rel_path`` in the mounted Ladyhawke directory, then unmount.
+    ``rel_path`` in the mounted source-volume directory, then unmount.
 
     ``snapshots`` is a list of ``(snap_name, date_str)`` tuples, newest-first
-    (as returned by ``all_ladyhawke_snapshots`` for the APFS layout).
+    (as returned by ``all_volume_snapshots`` for the APFS layout).
 
     Returns a dict mapping ``rel_path`` → list of
     ``(apfs_backup_path_str, date_str, file_size, mtime)`` tuples, newest-first.
@@ -575,13 +638,13 @@ def scan_apfs_snapshots(
 
         try:
             with _mount_apfs_snapshot(snap_name, tm_volume) as mountpoint:
-                lh_root = _find_ladyhawke_in_snapshot(mountpoint)
+                lh_root = _find_source_volume_in_snapshot(mountpoint, volume_name)
 
                 if debug and not _debug_done:
                     _debug_done = True
                     _debug_snapshot_tree(mountpoint, depth=3)
                     print(
-                        f"\n  DEBUG: Ladyhawke root found at: {lh_root}",
+                        f"\n  DEBUG: source volume root found at: {lh_root}",
                         file=sys.stderr,
                     )
                     if lh_root is not None:
@@ -592,7 +655,7 @@ def scan_apfs_snapshots(
                             )
                     else:
                         print(
-                            "  DEBUG: Ladyhawke not found in snapshot — skipping search.",
+                            f"  DEBUG: '{volume_name}' not found in snapshot — skipping search.",
                             file=sys.stderr,
                         )
                     print("", file=sys.stderr)
@@ -632,9 +695,12 @@ def cmd_inspect(args):
         print(f"ERROR: Time Machine volume not found: {tm_volume}", file=sys.stderr)
         sys.exit(1)
 
+    source_volume = normalize_source_volume(args.source_volume)
+    volume_name = Path(source_volume).name if source_volume else None
+
     print(f"\n=== Inspecting Time Machine volume: {tm_volume} ===\n")
 
-    layout = discover_tm_layout(tm_volume)
+    layout = discover_tm_layout(tm_volume, volume_name or "")
 
     print(f"Layout type : {layout['layout_type']}")
 
@@ -643,19 +709,26 @@ def cmd_inspect(args):
 
     if layout["layout_type"] == "apfs":
         snaps = layout.get("apfs_snapshots", [])
-        print(f"\nAPFS Time Machine snapshots: {len(snaps)} total")
+        tm_count = sum(1 for s in snaps if s.get("source") == "timemachine")
+        ccc_count = sum(1 for s in snaps if s.get("source") == "ccc")
+        print(
+            f"\nAPFS snapshots: {len(snaps)} total  "
+            f"({tm_count} Time Machine, {ccc_count} Carbon Copy Cloner)"
+        )
         if snaps:
             # Show a few oldest and newest; snapshots are newest-first after sorting
             sorted_snaps = sorted(snaps, key=lambda s: s["date"], reverse=True)
             display = sorted_snaps[:3]
             tail = sorted_snaps[-3:] if len(sorted_snaps) > 6 else []
             for s in display:
-                print(f"  {s['date']}  {s['name']}")
+                label = {"timemachine": "TM ", "ccc": "CCC"}.get(s.get("source", ""), "   ")
+                print(f"  [{label}] {s['date']}  {s['name']}")
             if len(sorted_snaps) > 6:
                 print(f"  ... ({len(sorted_snaps) - 6} more) ...")
             for s in tail:
                 if s not in display:
-                    print(f"  {s['date']}  {s['name']}")
+                    label = {"timemachine": "TM ", "ccc": "CCC"}.get(s.get("source", ""), "   ")
+                    print(f"  [{label}] {s['date']}  {s['name']}")
             print(f"\n  Newest: {sorted_snaps[0]['date']}")
             print(f"  Oldest: {sorted_snaps[-1]['date']}")
         print(
@@ -667,34 +740,42 @@ def cmd_inspect(args):
     # modern / unknown layout
     print(f"Hosts found : {layout['hosts'] or ['(none)']}")
 
+    vol_label = volume_name or "<volume>"
     for host, snap_dirs in layout.get("snapshots", {}).items():
         print(f"\nHost: {host}")
         print(f"  Snapshots ({len(snap_dirs)} total):")
         if snap_dirs:
             # Show oldest and newest to keep output compact
             for snap in snap_dirs[:3]:
-                lh = snap / "Ladyhawke"
-                has_lh = "✓ Ladyhawke" if lh.is_dir() else "  (no Ladyhawke)"
-                print(f"    {snap.name}  {has_lh}")
+                vol_dir = snap / vol_label
+                has_vol = f"✓ {vol_label}" if vol_dir.is_dir() else f"  (no {vol_label})"
+                print(f"    {snap.name}  {has_vol}")
             if len(snap_dirs) > 6:
                 print(f"    ... ({len(snap_dirs) - 6} more) ...")
             for snap in snap_dirs[-3:]:
                 if snap not in snap_dirs[:3]:
-                    lh = snap / "Ladyhawke"
-                    has_lh = "✓ Ladyhawke" if lh.is_dir() else "  (no Ladyhawke)"
-                    print(f"    {snap.name}  {has_lh}")
+                    vol_dir = snap / vol_label
+                    has_vol = f"✓ {vol_label}" if vol_dir.is_dir() else f"  (no {vol_label})"
+                    print(f"    {snap.name}  {has_vol}")
 
-    snapshots = all_ladyhawke_snapshots(layout)
-    print(f"\nSnapshots containing Ladyhawke: {len(snapshots)}")
-    if snapshots:
-        print(f"  Newest: {snapshots[0][1]}  ({snapshots[0][0]})")
-        print(f"  Oldest: {snapshots[-1][1]}  ({snapshots[-1][0]})")
+    snapshots = all_volume_snapshots(layout, vol_label) if volume_name else []
+    if volume_name:
+        print(f"\nSnapshots containing {vol_label}: {len(snapshots)}")
+        if snapshots:
+            print(f"  Newest: {snapshots[0][1]}  ({snapshots[0][0]})")
+            print(f"  Oldest: {snapshots[-1][1]}  ({snapshots[-1][0]})")
 
-    if not snapshots:
+        if not snapshots:
+            print(
+                f"\nWARNING: No snapshots containing a '{vol_label}' directory were found.\n"
+                "Check that the Time Machine volume is fully mounted and that the volume\n"
+                f"being backed up was named '{vol_label}'.",
+                file=sys.stderr,
+            )
+    else:
         print(
-            "\nWARNING: No snapshots containing a 'Ladyhawke' directory were found.\n"
-            "Check that the Time Machine volume is fully mounted and that the volume\n"
-            "being backed up was named 'Ladyhawke'.",
+            "\nNote: pass --source-volume to check for a specific volume directory "
+            "in each snapshot (e.g. --source-volume /Volumes/Ladyhawke).",
             file=sys.stderr,
         )
 
@@ -706,6 +787,8 @@ def cmd_inspect(args):
 def cmd_scan(args):
     csv_path = Path(args.csv)
     tm_volume = Path(args.tm_volume)
+    source_volume = normalize_source_volume(args.source_volume)
+    volume_name = Path(source_volume).name
 
     if not csv_path.exists():
         print(f"ERROR: CSV not found: {csv_path}", file=sys.stderr)
@@ -718,15 +801,15 @@ def cmd_scan(args):
     missing = load_missing_photos(csv_path)
     print(f"  {len(missing)} records loaded.", file=sys.stderr)
 
-    print(f"Discovering Time Machine layout on {tm_volume}...", file=sys.stderr)
-    layout = discover_tm_layout(tm_volume)
+    print(f"Discovering snapshot layout on {tm_volume}...", file=sys.stderr)
+    layout = discover_tm_layout(tm_volume, volume_name)
     is_apfs = layout["layout_type"] == "apfs"
-    snapshots = all_ladyhawke_snapshots(layout)
+    snapshots = all_volume_snapshots(layout, volume_name)
     print(f"  Layout type: {layout['layout_type']}", file=sys.stderr)
-    print(f"  {len(snapshots)} Time Machine snapshots found.", file=sys.stderr)
+    print(f"  {len(snapshots)} snapshots found.", file=sys.stderr)
     if not snapshots:
         print(
-            "WARNING: No Time Machine snapshots found. "
+            "WARNING: No snapshots found. "
             "Every record will be classified NOT_FOUND_IN_TIME_MACHINE.",
             file=sys.stderr,
         )
@@ -783,7 +866,7 @@ def cmd_scan(args):
 
     counters = {
         "total": 0,
-        "ladyhawke": 0,
+        "source_volume": 0,
         "present": 0,
         "found": 0,
         "multiple": 0,
@@ -803,17 +886,17 @@ def cmd_scan(args):
         for row in missing:
             expected_path = row.get("Photo", "").strip()
             counters["total"] += 1
-            rel = relative_ladyhawke_path(expected_path)
+            rel = relative_volume_path(expected_path, source_volume)
             if rel is None:
                 classified.append((row, expected_path, None, "other"))
                 counters["other"] += 1
             elif Path(expected_path).exists():
                 classified.append((row, expected_path, rel, "present"))
                 counters["present"] += 1
-                counters["ladyhawke"] += 1
+                counters["source_volume"] += 1
             else:
                 classified.append((row, expected_path, rel, "search"))
-                counters["ladyhawke"] += 1
+                counters["source_volume"] += 1
                 rel_paths_needing_search.append(rel)
 
         # Deduplicate rel_paths for the scan (there may be duplicates in the CSV).
@@ -836,6 +919,7 @@ def cmd_scan(args):
                 unique_rels,
                 snapshots_to_scan,
                 tm_volume,
+                volume_name,
                 progress_callback=_progress,
                 debug=args.debug,
             )
@@ -858,7 +942,7 @@ def cmd_scan(args):
                             "backup_date": "",
                             "file_size": "",
                             "mtime": "",
-                            "notes": "Expected path is not under /Volumes/Ladyhawke",
+                            "notes": f"Expected path is not under {source_volume}",
                         }
                     )
                 elif classification == "present":
@@ -915,7 +999,7 @@ def cmd_scan(args):
                         )
 
         print(f"\nReport written to {output_path}\n")
-        _print_summary(counters)
+        _print_summary(counters, source_volume)
         return
 
     # -----------------------------------------------------------------------
@@ -932,7 +1016,7 @@ def cmd_scan(args):
             if i % 200 == 0 or i == len(missing):
                 print(f"  Processed {i}/{len(missing)}...", file=sys.stderr)
 
-            rel = relative_ladyhawke_path(expected_path)
+            rel = relative_volume_path(expected_path, source_volume)
 
             if rel is None:
                 counters["other"] += 1
@@ -945,14 +1029,14 @@ def cmd_scan(args):
                         "backup_date": "",
                         "file_size": "",
                         "mtime": "",
-                        "notes": "Expected path is not under /Volumes/Ladyhawke",
+                        "notes": f"Expected path is not under {source_volume}",
                     }
                 )
                 continue
 
-            counters["ladyhawke"] += 1
+            counters["source_volume"] += 1
 
-            # Check whether the file is already present on Ladyhawke.
+            # Check whether the file is already present on the source volume.
             if Path(expected_path).exists():
                 counters["present"] += 1
                 writer.writerow(
@@ -1024,18 +1108,18 @@ def cmd_scan(args):
             )
 
     print(f"\nReport written to {output_path}\n")
-    _print_summary(counters)
+    _print_summary(counters, source_volume)
 
 
-def _print_summary(counters):
+def _print_summary(counters, source_volume):
     recoverable = counters["found"] + counters["multiple"]
     print(f"Missing Lightroom records examined : {counters['total']:>7,}")
-    print(f"Ladyhawke records                  : {counters['ladyhawke']:>7,}")
+    print(f"Source-volume records ({source_volume}): {counters['source_volume']:>7,}")
     print(f"  Already present on disk          : {counters['present']:>7,}")
     print(f"  Found in Time Machine            : {counters['found']:>7,}")
     print(f"  Multiple TM versions             : {counters['multiple']:>7,}")
     print(f"  Not found in Time Machine        : {counters['not_found']:>7,}")
-    print(f"Other/non-Ladyhawke volumes        : {counters['other']:>7,}")
+    print(f"Other/non-source-volume records    : {counters['other']:>7,}")
     print(f"Total recoverable from TM          : {recoverable:>7,}")
 
 
@@ -1050,6 +1134,35 @@ def cmd_restore(args):
     if not report_path.exists():
         print(f"ERROR: Report not found: {report_path}", file=sys.stderr)
         sys.exit(1)
+
+    # Determine the source volume (e.g. /Volumes/Ladyhawke).
+    # If --source-volume is given, use it; otherwise infer from the first expected_path in the report.
+    source_volume = getattr(args, "source_volume", None)
+    if source_volume:
+        volume_name = Path(source_volume).name
+    else:
+        # Auto-detect from the first row's expected_path (e.g. /Volumes/Ladyhawke/foo → "Ladyhawke").
+        volume_name = None
+        try:
+            with open(report_path, newline="", encoding="utf-8") as _fh:
+                _reader = csv.DictReader(_fh)
+                for _row in _reader:
+                    _ep = _row.get("expected_path", "").strip()
+                    if _ep:
+                        _parts = Path(_ep).parts
+                        if len(_parts) >= 3:
+                            volume_name = _parts[2]
+                            source_volume = str(Path(*_parts[:3]))
+                        break
+        except OSError:
+            pass
+        if not volume_name:
+            print(
+                "ERROR: Cannot determine source volume from report. "
+                "Pass --source-volume explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     mode_label = "DRY-RUN" if dry_run else "EXECUTE"
     print(f"\n=== Restore mode: {mode_label} ===\n")
@@ -1201,7 +1314,7 @@ def cmd_restore(args):
         )
         try:
             with _mount_apfs_snapshot(snap_name, tm_vol) as mountpoint:
-                lh_root = _find_ladyhawke_in_snapshot(mountpoint)
+                lh_root = _find_source_volume_in_snapshot(mountpoint, volume_name)
                 for row in group_list:
                     backup = row["backup_path"]
                     expected = row["expected_path"]
@@ -1215,7 +1328,7 @@ def cmd_restore(args):
                         continue
                     if lh_root is None:
                         log("COPY", "ERROR", backup, expected,
-                            notes="Ladyhawke not found in mounted snapshot")
+                            notes=f"'{volume_name}' not found in mounted snapshot")
                         errors += 1
                         continue
                     src = lh_root / rel
@@ -1268,7 +1381,10 @@ def cmd_hash(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Recover Lightroom Classic missing originals from a Time Machine backup.",
+        description=(
+            "Recover Lightroom Classic missing originals from a Time Machine "
+            "or Carbon Copy Cloner (CCC) APFS snapshot backup."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1276,24 +1392,42 @@ def build_parser():
 
     # inspect
     p_inspect = sub.add_parser(
-        "inspect", help="Discover and report Time Machine layout."
+        "inspect", help="Discover and report Time Machine / CCC snapshot layout."
     )
     p_inspect.add_argument(
         "tm_volume",
-        help="Path to mounted Time Machine volume (e.g. /Volumes/iMacBackup3).",
+        help="Path to mounted backup volume (e.g. /Volumes/iMacBackup3 or /Volumes/Catbus).",
+    )
+    p_inspect.add_argument(
+        "--source-volume",
+        default=None,
+        help=(
+            "Source volume whose backups you want to check, as either a volume name "
+            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke).  "
+            "When provided, each snapshot is checked for the presence of that volume directory."
+        ),
     )
     p_inspect.set_defaults(func=cmd_inspect)
 
     # scan
     p_scan = sub.add_parser(
-        "scan", help="Search Time Machine for missing Lightroom originals."
+        "scan", help="Search Time Machine / CCC snapshots for missing Lightroom originals."
     )
     p_scan.add_argument(
         "csv", help="Path to Lightroom missing-photos CSV (must have a 'Photo' column)."
     )
     p_scan.add_argument(
         "tm_volume",
-        help="Path to mounted Time Machine volume (e.g. /Volumes/iMacBackup3).",
+        help="Path to mounted backup volume (e.g. /Volumes/iMacBackup3 or /Volumes/Catbus).",
+    )
+    p_scan.add_argument(
+        "--source-volume",
+        required=True,
+        help=(
+            "Source volume that was backed up, as either a volume name "
+            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke).  "
+            "Used to strip the volume prefix and locate the backup directory inside snapshots."
+        ),
     )
     p_scan.add_argument(
         "--output",
@@ -1336,6 +1470,15 @@ def build_parser():
         help=(
             "Copy Time Machine originals to their Lightroom-expected paths. "
             "Default is dry-run; pass --execute to copy files."
+        ),
+    )
+    p_restore.add_argument(
+        "--source-volume",
+        default=None,
+        help=(
+            "Original source volume, as either a volume name or full path "
+            "(e.g. Ladyhawke or /Volumes/Ladyhawke).  "
+            "If omitted, inferred from the expected_path column in the report CSV."
         ),
     )
     p_restore.add_argument(
