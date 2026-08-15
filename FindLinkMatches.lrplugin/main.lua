@@ -34,7 +34,6 @@ end
 local function setDebugCaption(progressScope, totalPhotos, message)
     if DEBUG_VERBOSE and totalPhotos <= DEBUG_MAX_ECHO_PHOTOS then
         progressScope:setCaption(message)
-        LrTasks.yield()
     end
 end
 
@@ -254,18 +253,7 @@ end
 
 local function runWithErrorLogging()
     local debugPath = LrPathUtils.child(desktop, "find_missing_debug.log")
-
-    local ok, err = pcall(function()
-        findAndCompareMissingPhotos()
-    end)
-
-    if not ok then
-        debugLog(debugPath, "FATAL ERROR: " .. tostring(err))
-        LrDialogs.message(
-            "Match search failed.",
-            "A Lua error occurred. Details were written to:\n" .. debugPath .. "\n\n" .. tostring(err)
-        )
-    end
+    findAndCompareMissingPhotos()
 end
 
 LrTasks.startAsyncTask(runWithErrorLogging)

@@ -39,7 +39,6 @@ end
 local function setDebugCaption(progressScope, totalPhotos, message)
     if DEBUG_VERBOSE and totalPhotos <= DEBUG_MAX_ECHO_PHOTOS then
         progressScope:setCaption(message)
-        LrTasks.yield()
     end
 end
 
