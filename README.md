@@ -203,31 +203,57 @@ using **Write CSV File for Photos**.
 # Install Python dependencies:
 source setup.env   # or: pip install pandas python-dateutil
 
-python3 relink_missing_photos.py data/Missing_Photos.csv
+# Walk a directory tree to find candidates (--search-root required in this mode):
+python3 relink_missing_photos.py data/Missing_Photos.csv \
+    --search-root /Volumes/Ladyhawke
+
+# Alternative: use macOS Spotlight (mdfind) instead of walking the tree:
+python3 relink_missing_photos.py data/Missing_Photos.csv --mdfind
 ```
 
-Indexes all files under `/Volumes/Ladyhawke` by filename stem, then matches each
-missing photo against candidates using `exiftool`-extracted EXIF data (timestamp,
-camera make, width, height).  Ignores `.xmp` sidecars and requires extension/type
-matching (case-insensitive) before generating hardlink commands.
+Matches each missing photo against candidates using `exiftool`-extracted EXIF data
+(timestamp, camera make, width, height).  Ignores `.xmp` sidecars and requires
+extension/type matching (case-insensitive) before generating hardlink commands.
 
 Unlike the plugin, this step is not limited to what Lightroom currently returns
 from catalog search and emits separate outputs for exact relinks, resolution
 mismatches, and still-missing records.
 
-Options:
+#### Candidate discovery modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| Directory walk (default) | `--search-root PATH` | Indexes all files under `PATH` by filename stem at startup, then looks up candidates in memory. Fast for repeated runs over a large tree. |
+| Spotlight | `--mdfind` | Uses macOS `mdfind -name` to find candidates per photo. `--search-root` is optional (constrains the Spotlight scope). No upfront indexing; useful when the search root is very large or unknown. |
+
+#### Options
 
 ```
---test-n N               Process a random sample of N rows (for testing)
---exclude-sources PATH   Exclude directory subtrees from candidate indexing
---exclude-targets PATH   Skip missing-photo entries whose path contains this string
+--search-root PATH       Root directory to index for candidates (required unless --mdfind).
+--mdfind                 Use macOS Spotlight instead of a directory walk.
+--copy-across-volumes    When a candidate is on a different volume than the target,
+                         emit a 'cp' command instead of 'ln'.
+--output-dir DIR         Write all output files to DIR instead of the current directory.
+--test-n N               Process a random sample of N rows (implies --debug when N < 20).
+--exclude-sources PATH   Exclude directory subtrees from candidate indexing/search.
+--exclude-targets PATH   Skip missing-photo entries whose path contains this string.
+--skip-rows N            Skip the first N data rows in the CSV (used when resuming).
+--rows-to-process N      Process at most N rows after skipping (used when resuming).
+--append-outputs         Append to existing output files instead of overwriting.
+--debug                  Print full candidate match details and rejection reasons.
+--verbose-debug          Print timestamped trace messages around each blocking call
+                         (mdfind, exiftool, dateparser) to pinpoint hangs.
+--allow-timezone-mismatches
+                         Accept candidates whose timestamp differs by an even half-hour
+                         offset (±30-min granularity, up to ±26 h) with a residual ≤1 min.
+                         Useful for cameras that store local time without timezone info.
 ```
 
-Outputs (written to the current working directory):
+#### Outputs (written to `--output-dir`, default: current directory)
 
 | File | Contents |
 |------|----------|
-| `relink_good_matches.sh` | `ln` commands for confirmed matches (exact resolution). Best match is the active command; alternate candidates appear as `# Alt:` comment lines. |
+| `relink_good_matches.sh` | `ln` (or `cp` with `--copy-across-volumes`) commands for confirmed matches (exact resolution). Best match is the active command; alternate candidates appear as `# Alt:` comment lines. |
 | `resolution_mismatch.sh` | Best-guess links where resolution differs (same file extension/type only). Each entry shows the Lightroom-known resolution as `LR:WxH` in the comment — note that Lightroom sometimes only knows the Smart Preview resolution, so the matched file on disk may have a *higher* resolution than what Lightroom reports, which is normal and desirable. Comment lines include alternate candidates prefixed `# Alt:`. Entries where the candidate dimensions exceed the `LR:` dimensions are tagged with `HIGHER_RESOLUTION` in the comment. |
 | `higher_resolution.sh` | Automatically extracted subset of `resolution_mismatch.sh` containing only entries where the matched file is higher resolution than Lightroom's record (tagged `HIGHER_RESOLUTION`). These are particularly safe to apply — the matched file likely has more detail than the Smart Preview Lightroom knows about. This file is generated automatically; you can also regenerate it manually with `grep -A 1 'HIGHER_RESOLUTION' resolution_mismatch.sh > higher_resolution.sh`. |
 | `import_other_formats.csv` | Ranked cross-format candidates for future import/relink handling (only when no same-extension candidate was found) |
@@ -238,6 +264,13 @@ The summary counts each input photo exactly once in its primary outcome category
 (`Relink commands (best)`, `Resolution mismatches (match)`, `Import other formats`, or
 `Still missing`).  Alternate candidates and comment lines are counted separately so
 the total primary outcomes always equals the number of photos processed.
+
+#### Interrupt and resume
+
+If the script is interrupted with Ctrl-C it flushes all output files and prints a
+ready-to-paste resume command using `--skip-rows`, `--rows-to-process`, and
+`--append-outputs`, so you can pick up where it left off without reprocessing rows
+already written to the output files.
 
 > **Note — pure Lua alternative (work in progress):** There is an experimental
 > `FindLinkMatches.lrplugin` function called **Find Matches to Missing Photos**
