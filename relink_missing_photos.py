@@ -134,7 +134,9 @@ def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
 
 def sort_key(candidate):
+    # Prefer: exact tz, raw format, best camera match, then higher resolution (all else equal)
     return (candidate['tz_adjusted'], -candidate['raw'], -candidate['camera_score'], -candidate['resolution'])
+
 
 def format_candidate_meta(candidate):
     return f'{candidate["path"]} ({candidate["meta"]["Width"]}x{candidate["meta"]["Height"]}, {candidate["meta"]["Camera Make"]})'
@@ -201,6 +203,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     mismatch_path = out_dir / "resolution_mismatch.sh"
     still_missing_path = out_dir / "Still_Missing_Photos.csv"
     import_other_formats_path = out_dir / "import_other_formats.csv"
+    import_same_format_higher_res_path = out_dir / "import_same_format_higher_resolution.csv"
 
     try:
         missing_photos_df = pd.read_csv(csv_filename)
@@ -231,6 +234,14 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     still_missing = []
     resolution_mismatches = []
     import_other_formats = []
+    import_same_format_higher_res = []
+
+    # Separate counters for meaningful summary (each photo counted once in primary category)
+    relink_best_count = 0
+    relink_alt_count = 0
+    resolution_match_count = 0
+    resolution_alt_count = 0
+    import_other_formats_primary_count = 0
 
     total = len(missing_photos_df)
     print(f"Processing {total} rows...\n", file=sys.stderr)
@@ -353,7 +364,25 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             if len(exact_matches) == 1:
                 cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
                 relink_commands.append(cmd)
+                relink_best_count += 1
                 decision_made = True
+                # Check for same-extension candidates with higher resolution than the exact match
+                best_res = exact_matches[0]['resolution']
+                for rank, candidate in enumerate(
+                    s for s in same_type_sorted if s['resolution'] > best_res
+                ):
+                    import_same_format_higher_res.append({
+                        "missing_file": original_path,
+                        "matched_file": str(exact_matches[0]['path']),
+                        "new_file": str(candidate["path"]),
+                        "lr_width": target_w,
+                        "lr_height": target_h,
+                        "matched_width": exact_matches[0]['meta']['Width'],
+                        "matched_height": exact_matches[0]['meta']['Height'],
+                        "new_width": candidate["meta"]["Width"],
+                        "new_height": candidate["meta"]["Height"],
+                        "rank": rank,
+                    })
             elif len(exact_matches) > 1:
                 sorted_matches = sorted(exact_matches, key=sort_key)
                 best = sorted_matches[0]
@@ -362,20 +391,41 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                     f'# Selected best match from {len(sorted_matches)} candidates: {format_candidate_meta(best)}'
                 )
                 relink_commands.append(cmd)
+                relink_best_count += 1
                 for alt in sorted_matches[1:]:
                     relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                    relink_alt_count += 1
                 decision_made = True
+                # Check for same-extension candidates with higher resolution than the best exact match
+                best_res = best['resolution']
+                for rank, candidate in enumerate(
+                    s for s in same_type_sorted if s['resolution'] > best_res
+                ):
+                    import_same_format_higher_res.append({
+                        "missing_file": original_path,
+                        "matched_file": str(best['path']),
+                        "new_file": str(candidate["path"]),
+                        "lr_width": target_w,
+                        "lr_height": target_h,
+                        "matched_width": best['meta']['Width'],
+                        "matched_height": best['meta']['Height'],
+                        "new_width": candidate["meta"]["Width"],
+                        "new_height": candidate["meta"]["Height"],
+                        "rank": rank,
+                    })
             elif same_type_sorted:
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 resolution_mismatches.append(
-                    f'# Resolution mismatch: {original_path} -> {format_candidate_meta(best)}'
+                    f'# Resolution mismatch (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
                 )
                 resolution_mismatches.append(cmd)
                 emitted_resolution_mismatch = True
+                resolution_match_count += 1
                 decision_made = True
                 for alt in same_type_sorted[1:]:
                     resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                    resolution_alt_count += 1
                 higher_res_other_formats = [
                     s for s in other_type_sorted
                     if s['resolution'] > best['resolution']
@@ -401,6 +451,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                         "new_height": candidate["meta"]["Height"],
                         "rank": rank,
                     })
+                import_other_formats_primary_count += 1
                 decision_made = True
 
             # Defensive guard: if same-type candidates exist and no exact match exists,
@@ -409,11 +460,13 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 resolution_mismatches.append(
-                    f'# Resolution mismatch: {original_path} -> {format_candidate_meta(best)}'
+                    f'# Resolution mismatch (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
                 )
                 resolution_mismatches.append(cmd)
+                resolution_match_count += 1
                 for alt in same_type_sorted[1:]:
                     resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                    resolution_alt_count += 1
                 decision_made = True
                 if debug:
                     print("  [DEBUG] Fallback guard emitted resolution mismatch entry.", file=sys.stderr)
@@ -458,11 +511,29 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     else:
         import_other_formats_df.to_csv(import_other_formats_path, index=False)
 
+    # Write import_same_format_higher_resolution.csv
+    import_same_format_higher_res_df = pd.DataFrame(
+        import_same_format_higher_res,
+        columns=["missing_file", "matched_file", "new_file",
+                 "lr_width", "lr_height",
+                 "matched_width", "matched_height",
+                 "new_width", "new_height", "rank"],
+    )
+    if append_outputs and import_same_format_higher_res_path.exists():
+        import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, mode="a", index=False, header=False)
+    else:
+        import_same_format_higher_res_df.to_csv(import_same_format_higher_res_path, index=False)
+
     print("\nSummary:", file=sys.stderr)
-    print(f"  Relink commands generated: {len(relink_commands)}", file=sys.stderr)
-    print(f"  Resolution mismatches: {len(resolution_mismatches)}", file=sys.stderr)
-    print(f"  Import other formats: {len(import_other_formats)}", file=sys.stderr)
-    print(f"  Still missing: {len(still_missing)}", file=sys.stderr)
+    print(f"  Relink commands (best):            {relink_best_count}", file=sys.stderr)
+    print(f"  Relink commands (alternate):       {relink_alt_count}", file=sys.stderr)
+    print(f"  Resolution mismatches (match):     {resolution_match_count}", file=sys.stderr)
+    print(f"  Resolution mismatches (alternate): {resolution_alt_count}", file=sys.stderr)
+    print(f"  Import other formats:              {import_other_formats_primary_count} photos ({len(import_other_formats)} candidates)", file=sys.stderr)
+    print(f"  Import higher res same format:     {len(import_same_format_higher_res)}", file=sys.stderr)
+    print(f"  Still missing:                     {len(still_missing)}", file=sys.stderr)
+    total_primary = relink_best_count + resolution_match_count + import_other_formats_primary_count + len(still_missing)
+    print(f"  (Total primary outcomes: {total_primary} / {total})", file=sys.stderr)
     print(f"\nDone. Outputs written to: {out_dir}/")
 
 if __name__ == "__main__":
