@@ -206,7 +206,8 @@ python3 relink_missing_photos.py data/Missing_Photos.csv
 
 Indexes all files under `/Volumes/Ladyhawke` by filename stem, then matches each
 missing photo against candidates using `exiftool`-extracted EXIF data (timestamp,
-camera make, width, height).  Handles resolution mismatches separately.
+camera make, width, height).  Ignores `.xmp` sidecars and requires extension/type
+matching (case-insensitive) before generating hardlink commands.
 
 Unlike the plugin, this step is not limited to what Lightroom currently returns
 from catalog search and emits separate outputs for exact relinks, resolution
@@ -225,7 +226,8 @@ Outputs (written to the current working directory):
 | File | Contents |
 |------|----------|
 | `relink_good_matches.sh` | `ln` commands for confirmed matches |
-| `resolution_mismatch.sh` | Best-guess links where resolution differs |
+| `resolution_mismatch.sh` | Best-guess links where resolution differs (same file extension/type only) |
+| `import_other_formats.csv` | Ranked cross-format candidates for future import/relink handling |
 | `Still_Missing_Photos.csv` | Records with no match found |
 
 ### Comparison

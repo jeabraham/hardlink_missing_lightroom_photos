@@ -155,6 +155,14 @@ before attempting a hardlink.
 
 Ambiguous matches should never be linked automatically.
 
+Future TODO for cross-format candidates:
+
+* Add a Lightroom Lua workflow that consumes `import_other_formats.csv`.
+* At minimum, support importing rank-0 `new_file` candidates and copying develop
+  settings from `missing_file` where Lightroom APIs permit it.
+* If format-specific automation is unreliable, fall back to putting all
+  cross-format candidates into a Lightroom collection for manual review/sorting.
+
 ## Why This Situation Exists
 
 A significant source of the missing records appears to be interaction between

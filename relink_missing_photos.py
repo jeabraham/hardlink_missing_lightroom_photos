@@ -16,6 +16,7 @@ TIME_DELTA = timedelta(minutes=5)
 TZ_MISMATCH_RESIDUAL = timedelta(minutes=1)  # allowed residual after removing tz offset
 TZ_MISMATCH_MAX = timedelta(hours=26)         # max tz offset to consider
 RAW_EXTENSIONS = {".dng", ".orf", ".arw", ".cr2", ".nef", ".rw2", ".raf", ".pef"}
+IGNORED_CANDIDATE_EXTENSIONS = {".xmp"}
 
 def get_exif_data_exiftool(image_path):
     try:
@@ -73,6 +74,8 @@ def index_files_by_stem(search_root, exclude_sources):
         if any(excl in root for excl in exclude_sources):
             continue
         for file in files:
+            if Path(file).suffix.lower() in IGNORED_CANDIDATE_EXTENSIONS:
+                continue
             stem = Path(file).stem
             full_path = Path(root) / file
             index.setdefault(stem.lower(), []).append(full_path)
@@ -101,6 +104,8 @@ def find_candidates_mdfind(stem, search_root=None, exclude_sources=None):
         # mdfind -name matches on any part of the filename; keep only exact stem matches
         if p.stem.lower() != stem.lower():
             continue
+        if p.suffix.lower() in IGNORED_CANDIDATE_EXTENSIONS:
+            continue
         if exclude_sources and any(excl in str(p) for excl in exclude_sources):
             continue
         candidates.append(p)
@@ -127,6 +132,9 @@ def make_link_or_copy_command(candidate_path, original_path, copy_across_volumes
 
 def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
+
+def sort_key(candidate):
+    return (candidate['tz_adjusted'], -candidate['raw'], -candidate['camera_score'], -candidate['resolution'])
 
 def timezone_offset_match(time_diff):
     """Return True if time_diff is within TZ_MISMATCH_RESIDUAL of an even half-hour offset
@@ -189,6 +197,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     relink_path = out_dir / "relink_good_matches.sh"
     mismatch_path = out_dir / "resolution_mismatch.sh"
     still_missing_path = out_dir / "Still_Missing_Photos.csv"
+    import_other_formats_path = out_dir / "import_other_formats.csv"
 
     try:
         missing_photos_df = pd.read_csv(csv_filename)
@@ -218,6 +227,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     relink_commands = []
     still_missing = []
     resolution_mismatches = []
+    import_other_formats = []
 
     total = len(missing_photos_df)
     print(f"Processing {total} rows...\n", file=sys.stderr)
@@ -232,6 +242,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
 
             filename = Path(original_path).name
             stem = Path(filename).stem.lower()
+            target_ext = Path(filename).suffix.lower()
 
             if use_mdfind:
                 candidates = find_candidates_mdfind(stem, search_root, exclude_sources)
@@ -305,6 +316,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 return {
                     'path': candidate,
                     'meta': meta,
+                    'ext': Path(candidate).suffix.lower(),
                     'raw': is_raw_file(candidate),
                     'tz_adjusted': tz_adjusted,
                     'camera_score': 2 if _csv_camera and file_camera and _csv_camera == file_camera
@@ -315,30 +327,62 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
 
             scored = list(filter(None, (score(c) for c in candidates)))
 
-            exact_matches = [s for s in scored if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
+            same_type_scored = [s for s in scored if s['ext'] == target_ext]
+            other_type_scored = [s for s in scored if s['ext'] != target_ext]
+
+            exact_matches = [s for s in same_type_scored if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
 
             if debug:
-                print(f"  scored={len(scored)}, exact_matches={len(exact_matches)}", file=sys.stderr)
+                print(
+                    f"  scored={len(scored)}, same_type={len(same_type_scored)}, "
+                    f"other_type={len(other_type_scored)}, exact_matches={len(exact_matches)}",
+                    file=sys.stderr
+                )
 
             if len(exact_matches) == 1:
                 cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
                 relink_commands.append(cmd)
             elif len(exact_matches) > 1:
-                sorted_matches = sorted(exact_matches, key=lambda x: (x['tz_adjusted'], -x['raw'], -x['camera_score'], -x['resolution']))
+                sorted_matches = sorted(exact_matches, key=sort_key)
                 best = sorted_matches[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 relink_commands.append(f'# Selected best match from {len(sorted_matches)} candidates')
                 relink_commands.append(cmd)
                 for alt in sorted_matches[1:]:
                     relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
-            elif scored:
-                resolution_sorted = sorted(scored, key=lambda x: (x['tz_adjusted'], -x['raw'], -x['camera_score'], -x['resolution']))
+            elif same_type_scored:
+                resolution_sorted = sorted(same_type_scored, key=sort_key)
                 best = resolution_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
                 resolution_mismatches.append(cmd)
                 for alt in resolution_sorted[1:]:
                     resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                higher_res_other_formats = [
+                    s for s in sorted(other_type_scored, key=sort_key)
+                    if s['resolution'] > best['resolution']
+                ]
+                for rank, candidate in enumerate(higher_res_other_formats):
+                    import_other_formats.append({
+                        "missing_file": original_path,
+                        "new_file": str(candidate["path"]),
+                        "missing_width": target_w,
+                        "missing_height": target_h,
+                        "new_width": candidate["meta"]["Width"],
+                        "new_height": candidate["meta"]["Height"],
+                        "rank": rank,
+                    })
+            elif other_type_scored:
+                for rank, candidate in enumerate(sorted(other_type_scored, key=sort_key)):
+                    import_other_formats.append({
+                        "missing_file": original_path,
+                        "new_file": str(candidate["path"]),
+                        "missing_width": target_w,
+                        "missing_height": target_h,
+                        "new_width": candidate["meta"]["Width"],
+                        "new_height": candidate["meta"]["Height"],
+                        "rank": rank,
+                    })
             else:
                 if debug:
                     print(f"  → no scored candidates passed filters", file=sys.stderr)
@@ -370,9 +414,20 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     else:
         still_missing_df.to_csv(still_missing_path, index=False)
 
+    # Write import_other_formats.csv
+    import_other_formats_df = pd.DataFrame(
+        import_other_formats,
+        columns=["missing_file", "new_file", "missing_width", "missing_height", "new_width", "new_height", "rank"],
+    )
+    if append_outputs and import_other_formats_path.exists():
+        import_other_formats_df.to_csv(import_other_formats_path, mode="a", index=False, header=False)
+    else:
+        import_other_formats_df.to_csv(import_other_formats_path, index=False)
+
     print("\nSummary:", file=sys.stderr)
     print(f"  Relink commands generated: {len(relink_commands)}", file=sys.stderr)
     print(f"  Resolution mismatches: {len(resolution_mismatches)}", file=sys.stderr)
+    print(f"  Import other formats: {len(import_other_formats)}", file=sys.stderr)
     print(f"  Still missing: {len(still_missing)}", file=sys.stderr)
     print(f"\nDone. Outputs written to: {out_dir}/")
 
