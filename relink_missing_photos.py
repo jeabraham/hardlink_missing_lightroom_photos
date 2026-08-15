@@ -327,21 +327,30 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
 
             scored = list(filter(None, (score(c) for c in candidates)))
 
-            same_type_scored = [s for s in scored if s['ext'] == target_ext]
-            other_type_scored = [s for s in scored if s['ext'] != target_ext]
+            same_type_sorted = sorted(
+                [s for s in scored if s['ext'] == target_ext],
+                key=sort_key
+            )
+            other_type_sorted = sorted(
+                [s for s in scored if s['ext'] != target_ext],
+                key=sort_key
+            )
 
-            exact_matches = [s for s in same_type_scored if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
+            exact_matches = [s for s in same_type_sorted if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
+            emitted_resolution_mismatch = False
+            decision_made = False
 
             if debug:
                 print(
-                    f"  scored={len(scored)}, same_type={len(same_type_scored)}, "
-                    f"other_type={len(other_type_scored)}, exact_matches={len(exact_matches)}",
+                    f"  scored={len(scored)}, same_type={len(same_type_sorted)}, "
+                    f"other_type={len(other_type_sorted)}, exact_matches={len(exact_matches)}",
                     file=sys.stderr
                 )
 
             if len(exact_matches) == 1:
                 cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
                 relink_commands.append(cmd)
+                decision_made = True
             elif len(exact_matches) > 1:
                 sorted_matches = sorted(exact_matches, key=sort_key)
                 best = sorted_matches[0]
@@ -350,16 +359,18 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 relink_commands.append(cmd)
                 for alt in sorted_matches[1:]:
                     relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
-            elif same_type_scored:
-                resolution_sorted = sorted(same_type_scored, key=sort_key)
-                best = resolution_sorted[0]
+                decision_made = True
+            elif same_type_sorted:
+                best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
                 resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
                 resolution_mismatches.append(cmd)
-                for alt in resolution_sorted[1:]:
+                emitted_resolution_mismatch = True
+                decision_made = True
+                for alt in same_type_sorted[1:]:
                     resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
                 higher_res_other_formats = [
-                    s for s in sorted(other_type_scored, key=sort_key)
+                    s for s in other_type_sorted
                     if s['resolution'] > best['resolution']
                 ]
                 for rank, candidate in enumerate(higher_res_other_formats):
@@ -372,8 +383,8 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                         "new_height": candidate["meta"]["Height"],
                         "rank": rank,
                     })
-            elif other_type_scored:
-                for rank, candidate in enumerate(sorted(other_type_scored, key=sort_key)):
+            elif other_type_sorted:
+                for rank, candidate in enumerate(other_type_sorted):
                     import_other_formats.append({
                         "missing_file": original_path,
                         "new_file": str(candidate["path"]),
@@ -383,7 +394,21 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                         "new_height": candidate["meta"]["Height"],
                         "rank": rank,
                     })
-            else:
+                decision_made = True
+
+            # Defensive guard: if same-type candidates exist and no exact match exists,
+            # resolution mismatch output must not be skipped.
+            if same_type_sorted and not exact_matches and not emitted_resolution_mismatch:
+                best = same_type_sorted[0]
+                cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
+                resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
+                resolution_mismatches.append(cmd)
+                for alt in same_type_sorted[1:]:
+                    resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+                decision_made = True
+                if debug:
+                    print("  [DEBUG] Fallback guard emitted resolution mismatch entry.", file=sys.stderr)
+            if not decision_made:
                 if debug:
                     print(f"  → no scored candidates passed filters", file=sys.stderr)
                 still_missing.append(row)
