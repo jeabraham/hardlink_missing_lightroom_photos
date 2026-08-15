@@ -312,14 +312,50 @@ def find_in_snapshots(rel_path: str, snapshots: list) -> list:
     """
     found = []
     for lh_root, date_str in snapshots:
-        if _snapshot_contains_path(lh_root, rel_path):
-            found.append((lh_root / rel_path, date_str))
+        actual = _resolve_case_insensitive(lh_root / rel_path)
+        if actual is not None:
+            found.append((actual, date_str))
     return found
+
+
+def _resolve_case_insensitive(candidate: Path) -> Path | None:
+    """
+    Return the actual on-disk path for ``candidate``, matching
+    case-insensitively at every path component that doesn't exist verbatim.
+
+    Returns the resolved Path if a matching file is found, or None.
+    """
+    if candidate.is_file():
+        return candidate
+
+    # Walk from the filesystem root toward the candidate, resolving each
+    # component case-insensitively when the exact name is absent.
+    parts = candidate.parts  # e.g. ('/', 'tmp', 'snap', 'RawPhotos', 'foo.JPG')
+    resolved = Path(parts[0])
+    for part in parts[1:]:
+        exact = resolved / part
+        if exact.exists():
+            resolved = exact
+        else:
+            # Try case-insensitive match among the directory's children.
+            try:
+                children = list(resolved.iterdir())
+            except OSError:
+                return None
+            part_lower = part.lower()
+            match = next(
+                (c for c in children if c.name.lower() == part_lower), None
+            )
+            if match is None:
+                return None
+            resolved = match
+
+    return resolved if resolved.is_file() else None
 
 
 def _snapshot_contains_path(lh_root: Path, rel_path: str) -> bool:
     candidate = lh_root / rel_path
-    return candidate.is_file()
+    return _resolve_case_insensitive(candidate) is not None
 
 
 def _snapshot_month_key(date_str: str) -> str | None:
@@ -389,8 +425,9 @@ def find_in_snapshots_anchored(
     found = []
     for idx in range(0, found_anchor_idx + 1):
         lh_root, date_str = snapshots[idx]
-        if _snapshot_contains_path(lh_root, rel_path):
-            found.append((lh_root / rel_path, date_str))
+        actual = _resolve_case_insensitive(lh_root / rel_path)
+        if actual is not None:
+            found.append((actual, date_str))
     return found
 
 
@@ -441,12 +478,83 @@ def is_apfs_backup_path(backup_path: str) -> bool:
 # APFS-specific snapshot scanning (mount each snapshot once, check all files)
 # ---------------------------------------------------------------------------
 
+def _find_ladyhawke_in_snapshot(mountpoint: Path) -> Path | None:
+    """
+    Locate the ``Ladyhawke`` directory inside a mounted APFS Time Machine snapshot.
+
+    On this backup volume the structure is::
+
+        <mountpoint>/
+            <dated-backup-dir>.backup/
+                Ladyhawke/          ← what we want
+                Data/
+                Homes/
+                ...
+            backup_manifest.plist
+            ...
+
+    The function scans the top-level non-hidden directories of ``mountpoint``
+    for a subdirectory named ``Ladyhawke`` (case-insensitive), returning the
+    first match.  Falls back to ``mountpoint / "Ladyhawke"`` if nothing is
+    found one level deeper.
+    """
+    try:
+        top_entries = [
+            e for e in mountpoint.iterdir()
+            if e.is_dir() and not e.name.startswith(".")
+        ]
+    except OSError:
+        return None
+
+    for top_dir in sorted(top_entries):
+        try:
+            for sub in top_dir.iterdir():
+                if sub.is_dir() and sub.name.lower() == "ladyhawke":
+                    return sub
+        except OSError:
+            continue
+
+    # Last resort: check directly under mountpoint (older layout).
+    direct = mountpoint / "Ladyhawke"
+    if direct.is_dir():
+        return direct
+
+    return None
+
+
+def _debug_snapshot_tree(mountpoint: Path, depth: int = 3) -> None:
+    """
+    Print the directory tree of a mounted snapshot up to ``depth`` levels deep.
+    Used to diagnose the actual path structure inside a Time Machine snapshot.
+    """
+    def _walk(path: Path, level: int) -> None:
+        if level > depth:
+            return
+        try:
+            entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
+        except PermissionError:
+            print(f"{'  ' * level}[permission denied]", file=sys.stderr)
+            return
+        for entry in entries[:30]:  # cap at 30 per directory to avoid flooding output
+            kind = "F" if entry.is_file() else "D"
+            print(f"{'  ' * level}[{kind}] {entry.name}", file=sys.stderr)
+            if entry.is_dir() and level < depth:
+                _walk(entry, level + 1)
+        if len(entries) > 30:
+            print(f"{'  ' * level}... ({len(entries) - 30} more entries)", file=sys.stderr)
+
+    print(f"\n  DEBUG: snapshot mounted at {mountpoint}", file=sys.stderr)
+    print(f"  DEBUG: directory tree (depth={depth}):", file=sys.stderr)
+    _walk(mountpoint, 1)
+
+
 def scan_apfs_snapshots(
     rel_paths: list[str],
     snapshots: list,
     tm_volume: Path,
     *,
     progress_callback=None,
+    debug: bool = False,
 ) -> dict:
     """
     For APFS Time Machine volumes, mount each snapshot once, check every
@@ -459,6 +567,7 @@ def scan_apfs_snapshots(
     ``(apfs_backup_path_str, date_str, file_size, mtime)`` tuples, newest-first.
     """
     results = {r: [] for r in rel_paths}
+    _debug_done = False  # only dump tree once
 
     for i, (snap_name, date_str) in enumerate(snapshots, 1):
         if progress_callback:
@@ -466,13 +575,40 @@ def scan_apfs_snapshots(
 
         try:
             with _mount_apfs_snapshot(snap_name, tm_volume) as mountpoint:
-                lh_root = mountpoint / "Ladyhawke"
+                lh_root = _find_ladyhawke_in_snapshot(mountpoint)
+
+                if debug and not _debug_done:
+                    _debug_done = True
+                    _debug_snapshot_tree(mountpoint, depth=3)
+                    print(
+                        f"\n  DEBUG: Ladyhawke root found at: {lh_root}",
+                        file=sys.stderr,
+                    )
+                    if lh_root is not None:
+                        for rel in rel_paths:
+                            print(
+                                f"  DEBUG: searching for: {lh_root / rel}",
+                                file=sys.stderr,
+                            )
+                    else:
+                        print(
+                            "  DEBUG: Ladyhawke not found in snapshot — skipping search.",
+                            file=sys.stderr,
+                        )
+                    print("", file=sys.stderr)
+
+                if lh_root is None:
+                    continue
+
                 for rel in rel_paths:
                     candidate = lh_root / rel
-                    if candidate.is_file():
-                        stat = file_stat(candidate)
+                    actual = _resolve_case_insensitive(candidate)
+                    if actual is not None:
+                        # Use the actual on-disk relative path (may differ in case).
+                        actual_rel = str(actual.relative_to(lh_root))
+                        stat = file_stat(actual)
                         results[rel].append((
-                            _apfs_backup_path(tm_volume, snap_name, rel),
+                            _apfs_backup_path(tm_volume, snap_name, actual_rel),
                             date_str,
                             stat["file_size"],
                             stat["mtime"],
@@ -701,6 +837,7 @@ def cmd_scan(args):
                 snapshots_to_scan,
                 tm_volume,
                 progress_callback=_progress,
+                debug=args.debug,
             )
         else:
             apfs_results = {r: [] for r in unique_rels}
@@ -1064,6 +1201,7 @@ def cmd_restore(args):
         )
         try:
             with _mount_apfs_snapshot(snap_name, tm_vol) as mountpoint:
+                lh_root = _find_ladyhawke_in_snapshot(mountpoint)
                 for row in group_list:
                     backup = row["backup_path"]
                     expected = row["expected_path"]
@@ -1075,7 +1213,12 @@ def cmd_restore(args):
                             notes="Malformed APFS backup path")
                         errors += 1
                         continue
-                    src = mountpoint / "Ladyhawke" / rel
+                    if lh_root is None:
+                        log("COPY", "ERROR", backup, expected,
+                            notes="Ladyhawke not found in mounted snapshot")
+                        errors += 1
+                        continue
+                    src = lh_root / rel
                     _restore_file(src, Path(expected), backup, expected, date)
         except OSError as exc:
             for row in group_list:
@@ -1174,6 +1317,15 @@ def build_parser():
         help=(
             "Month step used by --search-mode anchored (default: 1). "
             "Example: 1 probes every month, 2 probes every other month."
+        ),
+    )
+    p_scan.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Print the directory tree of the first mounted snapshot and the paths "
+            "being searched, to diagnose path-structure issues."
         ),
     )
     p_scan.set_defaults(func=cmd_scan)
