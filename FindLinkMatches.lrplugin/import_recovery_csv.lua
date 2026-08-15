@@ -12,6 +12,8 @@ local catalog = LrApplication.activeCatalog()
 local desktop = LrPathUtils.getStandardFilePath("desktop")
 local home = LrPathUtils.getStandardFilePath("home")
 local COLLECTION_NAME = "new-files-imported"
+local OLD_REPLACED_COLLECTION_NAME = "old-entries-replaced"
+local OLD_AND_NEW_COLLECTION_NAME = "old-and-new-entries"
 
 local function trim(s)
     return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
@@ -103,11 +105,11 @@ local function pathExistsAndReadable(path)
     return true, nil
 end
 
-local function findCollectionInSetRecursive(collectionSet)
+local function findCollectionInSetRecursive(collectionSet, name)
     local childCollections = collectionSet:getChildCollections()
     if childCollections then
         for _, col in ipairs(childCollections) do
-            if col:getName() == COLLECTION_NAME then
+            if col:getName() == name then
                 return col
             end
         end
@@ -116,7 +118,7 @@ local function findCollectionInSetRecursive(collectionSet)
     local childSets = collectionSet:getChildCollectionSets()
     if childSets then
         for _, childSet in ipairs(childSets) do
-            local found = findCollectionInSetRecursive(childSet)
+            local found = findCollectionInSetRecursive(childSet, name)
             if found then
                 return found
             end
@@ -126,11 +128,11 @@ local function findCollectionInSetRecursive(collectionSet)
     return nil
 end
 
-local function findExistingCollection()
+local function findExistingCollection(name)
     local rootCollections = catalog:getChildCollections()
     if rootCollections then
         for _, col in ipairs(rootCollections) do
-            if col:getName() == COLLECTION_NAME then
+            if col:getName() == name then
                 return col
             end
         end
@@ -139,7 +141,7 @@ local function findExistingCollection()
     local rootSets = catalog:getChildCollectionSets()
     if rootSets then
         for _, rootSet in ipairs(rootSets) do
-            local found = findCollectionInSetRecursive(rootSet)
+            local found = findCollectionInSetRecursive(rootSet, name)
             if found then
                 return found
             end
@@ -149,22 +151,22 @@ local function findExistingCollection()
     return nil
 end
 
-local function findOrCreateCollection(logf)
-    local existingCollection = findExistingCollection()
+local function findOrCreateCollection(name, logf)
+    local existingCollection = findExistingCollection(name)
     if existingCollection then
         return existingCollection
     end
 
     local createdCollection
     local ok, err = pcall(function()
-        catalog:withWriteAccessDo("Create collection " .. COLLECTION_NAME, function()
-            createdCollection = catalog:createCollection(COLLECTION_NAME, nil, true)
+        catalog:withWriteAccessDo("Create collection " .. name, function()
+            createdCollection = catalog:createCollection(name, nil, true)
         end)
     end)
 
     if not ok then
         if logf then
-            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to create collection: " .. tostring(err) .. "\n")
+            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to create collection '" .. name .. "': " .. tostring(err) .. "\n")
         end
         return nil
     end
@@ -218,10 +220,13 @@ local function importPhotosFromRecoveryCsv()
     end
 
     local newFileColumnIndex = nil
+    local missingFileColumnIndex = nil
     for i, name in ipairs(headers) do
-        if trim(name) == "new_file" then
+        local trimmedName = trim(name)
+        if trimmedName == "new_file" then
             newFileColumnIndex = i
-            break
+        elseif trimmedName == "missing_file" then
+            missingFileColumnIndex = i
         end
     end
 
@@ -244,6 +249,8 @@ local function importPhotosFromRecoveryCsv()
     progress:setCancelable(true)
 
     local importedPhotos = {}
+    local oldEntriesReplaced = {}  -- old catalog photos whose new_file was successfully imported
+    local oldAndNewPairs = {}      -- {old=photo, new=photo} pairs for old-and-new-entries collection
     local counts = {
         rowsExamined = 0,
         blankPaths = 0,
@@ -265,6 +272,9 @@ local function importPhotosFromRecoveryCsv()
         local values = csvParseLine(line)
         local rawPath = values[newFileColumnIndex] or ""
         local normalizedPath = normalizePath(rawPath)
+
+        local rawMissingPath = missingFileColumnIndex and (values[missingFileColumnIndex] or "") or ""
+        local normalizedMissingPath = normalizePath(rawMissingPath)
 
         if normalizedPath == "" then
             counts.blankPaths = counts.blankPaths + 1
@@ -305,6 +315,14 @@ local function importPhotosFromRecoveryCsv()
                     if importedPhoto then
                         counts.imported = counts.imported + 1
                         table.insert(importedPhotos, importedPhoto)
+
+                        if normalizedMissingPath ~= "" then
+                            local oldPhoto = catalog:findPhotoByPath(normalizedMissingPath)
+                            if oldPhoto then
+                                table.insert(oldEntriesReplaced, oldPhoto)
+                                table.insert(oldAndNewPairs, { old = oldPhoto, new = importedPhoto })
+                            end
+                        end
                     else
                         counts.failed = counts.failed + 1
                         logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t" .. normalizedPath .. "\t" .. tostring(importErr or "unknown import failure") .. "\n")
@@ -318,7 +336,7 @@ local function importPhotosFromRecoveryCsv()
 
     local collection = nil
     if #importedPhotos > 0 then
-        collection = findOrCreateCollection(logf)
+        collection = findOrCreateCollection(COLLECTION_NAME, logf)
         if collection then
             local addOk, addErr = pcall(function()
                 catalog:withWriteAccessDo("Add imported photos to " .. COLLECTION_NAME, function()
@@ -347,6 +365,43 @@ local function importPhotosFromRecoveryCsv()
         end
     end
 
+    if #oldEntriesReplaced > 0 then
+        local oldReplacedCollection = findOrCreateCollection(OLD_REPLACED_COLLECTION_NAME, logf)
+        if oldReplacedCollection then
+            local addOk, addErr = pcall(function()
+                catalog:withWriteAccessDo("Add old entries to " .. OLD_REPLACED_COLLECTION_NAME, function()
+                    oldReplacedCollection:addPhotos(oldEntriesReplaced)
+                end)
+            end)
+            if not addOk then
+                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_REPLACED_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
+            end
+        else
+            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. OLD_REPLACED_COLLECTION_NAME .. "'\n")
+        end
+    end
+
+    if #oldAndNewPairs > 0 then
+        local oldAndNewCollection = findOrCreateCollection(OLD_AND_NEW_COLLECTION_NAME, logf)
+        if oldAndNewCollection then
+            local combined = {}
+            for _, pair in ipairs(oldAndNewPairs) do
+                table.insert(combined, pair.old)
+                table.insert(combined, pair.new)
+            end
+            local addOk, addErr = pcall(function()
+                catalog:withWriteAccessDo("Add old and new entries to " .. OLD_AND_NEW_COLLECTION_NAME, function()
+                    oldAndNewCollection:addPhotos(combined)
+                end)
+            end)
+            if not addOk then
+                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
+            end
+        else
+            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "'\n")
+        end
+    end
+
     progress:setPortionComplete(#rows, #rows)
     progress:done()
 
@@ -367,8 +422,22 @@ local function importPhotosFromRecoveryCsv()
         .. "\nSkipped blank paths: " .. tostring(counts.blankPaths)
         .. "\n\nFailure log: " .. tostring(logPath)
 
-    if collection then
-        completionBody = completionBody .. "\nCollection used: " .. COLLECTION_NAME
+    if #importedPhotos > 0 then
+        completionBody = completionBody .. "\nNew imports collection: " .. COLLECTION_NAME
+    end
+    if #oldEntriesReplaced > 0 then
+        completionBody = completionBody
+            .. "\nOld entries replaced collection: " .. OLD_REPLACED_COLLECTION_NAME
+            .. " (" .. tostring(#oldEntriesReplaced) .. " entries)"
+            .. "\nOld + new side-by-side collection: " .. OLD_AND_NEW_COLLECTION_NAME
+            .. " (" .. tostring(#oldAndNewPairs) .. " pairs)"
+            .. "\n\nSuggested workflow:"
+            .. "\n1. Open the '" .. OLD_AND_NEW_COLLECTION_NAME .. "' collection and sort by filename so old and new entries appear side-by-side."
+            .. "\n2. Copy develop settings from the old entry to the new one if needed."
+            .. "\n3. Check resolution and other metadata."
+            .. "\n4. Flag old entries as Rejected (X key) if the new file is confirmed good."
+            .. "\n5. Optionally move the new file in the filesystem to match the old file's folder."
+            .. "\n6. To remove old entries from the entire catalog: select them in the collection, then click on a folder in the Folders panel (not the collection) and use Photo > Remove Photo from Catalog. (Deleting while in a collection view only removes the photo from that collection, not from the whole catalog.)"
     end
 
     LrDialogs.message(completionTitle, completionBody)
