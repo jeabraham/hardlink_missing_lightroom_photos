@@ -103,14 +103,56 @@ local function pathExistsAndReadable(path)
     return true, nil
 end
 
-local function findOrCreateCollection(logf)
-    local allCollections = catalog:getChildCollections()
-    if allCollections then
-        for _, col in ipairs(allCollections) do
+local function findCollectionInSetRecursive(collectionSet)
+    local childCollections = collectionSet:getChildCollections()
+    if childCollections then
+        for _, col in ipairs(childCollections) do
             if col:getName() == COLLECTION_NAME then
                 return col
             end
         end
+    end
+
+    local childSets = collectionSet:getChildCollectionSets()
+    if childSets then
+        for _, childSet in ipairs(childSets) do
+            local found = findCollectionInSetRecursive(childSet)
+            if found then
+                return found
+            end
+        end
+    end
+
+    return nil
+end
+
+local function findExistingCollection()
+    local rootCollections = catalog:getChildCollections()
+    if rootCollections then
+        for _, col in ipairs(rootCollections) do
+            if col:getName() == COLLECTION_NAME then
+                return col
+            end
+        end
+    end
+
+    local rootSets = catalog:getChildCollectionSets()
+    if rootSets then
+        for _, rootSet in ipairs(rootSets) do
+            local found = findCollectionInSetRecursive(rootSet)
+            if found then
+                return found
+            end
+        end
+    end
+
+    return nil
+end
+
+local function findOrCreateCollection(logf)
+    local existingCollection = findExistingCollection()
+    if existingCollection then
+        return existingCollection
     end
 
     local createdCollection
