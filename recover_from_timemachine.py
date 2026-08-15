@@ -3,9 +3,12 @@
 recover_from_timemachine.py — Phase 1 Time Machine / CCC snapshot recovery for Lightroom missing photos.
 
 Commands:
-  inspect   <tm_volume>            — Discover and report Time Machine / CCC snapshot layout.
-  scan      <csv> <tm_volume>      — Find missing Ladyhawke originals in snapshots.
-  restore   --report <csv>         — Copy found originals back (dry-run by default).
+  inspect   <tm_volume> [--source-volume <path>]
+                                   — Discover and report Time Machine / CCC snapshot layout.
+  scan      <csv> <tm_volume> --source-volume <path>
+                                   — Find missing originals in snapshots for the given source volume.
+  restore   --report <csv> [--source-volume <path>] [--execute]
+                                   — Copy found originals back (dry-run by default).
 
 Supports two kinds of APFS snapshots on the same volume:
   * Apple Time Machine  (com.apple.TimeMachine.YYYY-MM-DD-HHmmss.backup)
@@ -13,11 +16,11 @@ Supports two kinds of APFS snapshots on the same volume:
 
 Examples:
   python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
-  python3 recover_from_timemachine.py inspect /Volumes/Catbus
-  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3
-  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus
+  python3 recover_from_timemachine.py inspect /Volumes/Catbus --source-volume /Volumes/Ladyhawke
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/iMacBackup3 --source-volume /Volumes/Ladyhawke
+  python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus --source-volume /Volumes/Photos
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --dry-run
-  python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --execute
+  python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --source-volume /Volumes/Ladyhawke --execute
 """
 
 import argparse
