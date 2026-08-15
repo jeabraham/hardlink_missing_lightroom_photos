@@ -136,6 +136,9 @@ def is_raw_file(path):
 def sort_key(candidate):
     return (candidate['tz_adjusted'], -candidate['raw'], -candidate['camera_score'], -candidate['resolution'])
 
+def format_candidate_meta(candidate):
+    return f'{candidate["path"]} ({candidate["meta"]["Width"]}x{candidate["meta"]["Height"]}, {candidate["meta"]["Camera Make"]})'
+
 def timezone_offset_match(time_diff):
     """Return True if time_diff is within TZ_MISMATCH_RESIDUAL of an even half-hour offset
     (0, 30, 60, 90 … minutes) up to TZ_MISMATCH_MAX.  Covers all real-world timezone
@@ -355,7 +358,9 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 sorted_matches = sorted(exact_matches, key=sort_key)
                 best = sorted_matches[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
-                relink_commands.append(f'# Selected best match from {len(sorted_matches)} candidates')
+                relink_commands.append(
+                    f'# Selected best match from {len(sorted_matches)} candidates: {format_candidate_meta(best)}'
+                )
                 relink_commands.append(cmd)
                 for alt in sorted_matches[1:]:
                     relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
@@ -363,7 +368,9 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             elif same_type_sorted:
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
-                resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
+                resolution_mismatches.append(
+                    f'# Resolution mismatch: {original_path} -> {format_candidate_meta(best)}'
+                )
                 resolution_mismatches.append(cmd)
                 emitted_resolution_mismatch = True
                 decision_made = True
@@ -401,7 +408,9 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             if same_type_sorted and not exact_matches and not emitted_resolution_mismatch:
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
-                resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
+                resolution_mismatches.append(
+                    f'# Resolution mismatch: {original_path} -> {format_candidate_meta(best)}'
+                )
                 resolution_mismatches.append(cmd)
                 for alt in same_type_sorted[1:]:
                     resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
