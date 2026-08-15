@@ -42,14 +42,14 @@ def parse_datetime(value):
             return None
         # Apple/Cocoa timestamp: seconds since 2001-01-01 UTC
         if isinstance(value, (int, float)):
-            return APPLE_EPOCH + timedelta(seconds=float(value))
+            return (APPLE_EPOCH + timedelta(seconds=float(value))).replace(tzinfo=None)
         dt_str = str(value).strip()
         if not dt_str:
             return None
         # Also accept Apple timestamps that arrived as strings
         try:
             numeric_value = float(dt_str)
-            return APPLE_EPOCH + timedelta(seconds=numeric_value)
+            return (APPLE_EPOCH + timedelta(seconds=numeric_value)).replace(tzinfo=None)
         except ValueError:
             pass
         # EXIF-style datetime
@@ -57,7 +57,8 @@ def parse_datetime(value):
             dt_str = dt_str[:19]
             return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
         # Everything else
-        return dateparser.parse(dt_str)
+        result = dateparser.parse(dt_str)
+        return result.replace(tzinfo=None) if result is not None else None
     except Exception as e:
         print(f"⚠️ Failed to parse datetime: {value} ({e})", file=sys.stderr)
         return None
@@ -159,7 +160,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
 
     if test_n is not None:
         print(f"Running test mode with {test_n} random entries...", file=sys.stderr)
-        missing_photos_df = missing_photos_df.sample(n=min(test_n, len(missing_photos_df)), random_state=42)
+        missing_photos_df = missing_photos_df.sample(n=min(test_n, len(missing_photos_df)))
 
     # Build full-tree index only when not using mdfind
     if not use_mdfind:

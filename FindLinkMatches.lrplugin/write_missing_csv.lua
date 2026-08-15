@@ -5,6 +5,7 @@ local LrTasks = import 'LrTasks'
 local LrDialogs = import 'LrDialogs'
 local LrApplication = import 'LrApplication'
 local LrPathUtils = import 'LrPathUtils'
+local LrDate = import 'LrDate'
 
 local catalog = LrApplication.activeCatalog()
 local desktop = LrPathUtils.getStandardFilePath("desktop")
@@ -53,7 +54,8 @@ local function writeCsvFileForMissingPhotos()
         if isPhotoMissing(photo) then
             local path = photo:getRawMetadata("path") or ""
             local fileName = photo:getFormattedMetadata("fileName") or ""
-            local captureDate = photo:getRawMetadata("dateTimeOriginal") or ""
+            local rawDate = photo:getRawMetadata("dateTimeOriginal")
+            local captureDate = (rawDate and type(rawDate) == "number") and LrDate.timeToUserFormat(rawDate, "%Y-%m-%d %H:%M:%S") or tostring(rawDate or "")
             local width = photo:getRawMetadata("width") or ""
             local height = photo:getRawMetadata("height") or ""
             local cameraMake = photo:getFormattedMetadata("cameraMake")
