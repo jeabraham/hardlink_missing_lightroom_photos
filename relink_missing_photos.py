@@ -75,24 +75,102 @@ def index_files_by_stem(search_root, exclude_sources):
     print(f"Indexed {sum(len(v) for v in index.values())} files.\n", file=sys.stderr)
     return index
 
+def find_candidates_mdfind(stem, search_root=None, exclude_sources=None):
+    """Use macOS Spotlight (mdfind) to locate files matching stem, then filter."""
+    cmd = ["mdfind", "-name", stem]
+    if search_root:
+        cmd += ["-onlyin", str(search_root)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ mdfind error for {stem}: {e.stderr}", file=sys.stderr)
+        return []
+    except FileNotFoundError:
+        print("❌ mdfind not found — are you running on macOS?", file=sys.stderr)
+        return []
+    candidates = []
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        p = Path(line)
+        # mdfind -name matches on any part of the filename; keep only exact stem matches
+        if p.stem.lower() != stem.lower():
+            continue
+        if exclude_sources and any(excl in str(p) for excl in exclude_sources):
+            continue
+        candidates.append(p)
+    return candidates
+
+def get_volume(path):
+    """Return the top-level mount point (volume) of a path."""
+    p = Path(path).resolve()
+    parts = p.parts
+    # On macOS: /Volumes/VolName/...
+    if len(parts) >= 3 and parts[1] == "Volumes":
+        return Path(parts[0]) / parts[1] / parts[2]
+    # Fallback: filesystem root
+    return Path(parts[0])
+
+def make_link_or_copy_command(candidate_path, original_path, copy_across_volumes):
+    """Return a shell command string to link or copy a candidate to the target location."""
+    if copy_across_volumes:
+        src_vol = get_volume(candidate_path)
+        dst_vol = get_volume(original_path)
+        if src_vol != dst_vol:
+            return f'cp "{candidate_path}" "{original_path}"'
+    return f'ln "{candidate_path}" "{original_path}"'
+
 def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
 
-def main(csv_filename, search_root, test_n=None, exclude_sources=None, exclude_targets=None):
+def open_output(path, append):
+    """Open a shell-script output file for writing or appending; write shebang only when creating."""
+    mode = "a" if append else "w"
+    existed = append and Path(path).exists()
+    f = open(path, mode)
+    if not existed:
+        f.write("#!/bin/bash\n")
+    return f
+
+def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
+         exclude_targets=None, use_mdfind=False, copy_across_volumes=False,
+         output_dir=None, skip_rows=0, rows_to_process=None,
+         append_outputs=False, debug=False):
+
+    out_dir = Path(output_dir) if output_dir else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    relink_path = out_dir / "relink_good_matches.sh"
+    mismatch_path = out_dir / "resolution_mismatch.sh"
+    still_missing_path = out_dir / "Still_Missing_Photos.csv"
+
     try:
         missing_photos_df = pd.read_csv(csv_filename)
     except Exception as e:
         print(f"Error reading CSV file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Apply row windowing
+    if skip_rows:
+        missing_photos_df = missing_photos_df.iloc[skip_rows:]
+    if rows_to_process is not None:
+        missing_photos_df = missing_photos_df.iloc[:rows_to_process]
+
     if test_n is not None:
         print(f"Running test mode with {test_n} random entries...", file=sys.stderr)
-        missing_photos_df = missing_photos_df.sample(n=test_n, random_state=42)
+        missing_photos_df = missing_photos_df.sample(n=min(test_n, len(missing_photos_df)), random_state=42)
 
-    file_index = index_files_by_stem(search_root, exclude_sources or [])
+    # Build full-tree index only when not using mdfind
+    if not use_mdfind:
+        if search_root is None:
+            print("Error: --search-root is required unless --mdfind is specified.", file=sys.stderr)
+            sys.exit(1)
+        file_index = index_files_by_stem(search_root, exclude_sources or [])
+    else:
+        file_index = None  # candidates fetched per-stem via mdfind
 
     relink_commands = []
-    ambiguous_matches = []
     still_missing = []
     resolution_mismatches = []
 
@@ -107,105 +185,204 @@ def main(csv_filename, search_root, test_n=None, exclude_sources=None, exclude_t
         filename = Path(original_path).name
         stem = Path(filename).stem.lower()
 
-        candidates = file_index.get(stem, [])
+        if use_mdfind:
+            candidates = find_candidates_mdfind(stem, search_root, exclude_sources)
+        else:
+            candidates = file_index.get(stem, [])
+
+        if debug:
+            print(f"\n[DEBUG] Row {i}: {original_path}", file=sys.stderr)
+            print(f"  stem={stem}, candidates found={len(candidates)}", file=sys.stderr)
 
         if not candidates:
+            if debug:
+                print(f"  → no candidates found", file=sys.stderr)
             still_missing.append(row)
             continue
 
         if pd.isna(row.get("Date/Time Original (Capture)")) or pd.isna(row.get("Width")) or pd.isna(row.get("Height")):
+            if debug:
+                print(f"  → missing metadata in CSV row (date/width/height)", file=sys.stderr)
             still_missing.append(row)
             continue
 
         target_time = parse_datetime(row['Date/Time Original (Capture)'])
         if not target_time:
+            if debug:
+                print(f"  → could not parse target datetime: {row.get('Date/Time Original (Capture)')}", file=sys.stderr)
             still_missing.append(row)
             continue
 
         csv_camera = str(row.get('Camera Make') or '').strip().lower()
+        target_w = int(row['Width'])
+        target_h = int(row['Height'])
 
-        def score(candidate):
+        def score(candidate, _target_time=target_time, _csv_camera=csv_camera):
             meta = get_exif_data_exiftool(candidate)
             if not meta:
+                if debug:
+                    print(f"    [DEBUG] {candidate}: exiftool returned no data", file=sys.stderr)
                 return None
             cand_time = parse_datetime(meta['DateTime'])
             if not cand_time:
+                if debug:
+                    print(f"    [DEBUG] {candidate}: could not parse candidate datetime: {meta['DateTime']}", file=sys.stderr)
                 return None
-            if (target_time.tzinfo is None or cand_time.tzinfo is None):
-                target_time_naive = target_time.replace(tzinfo=None)
+            if _target_time.tzinfo is None or cand_time.tzinfo is None:
+                target_time_naive = _target_time.replace(tzinfo=None)
                 cand_time_naive = cand_time.replace(tzinfo=None)
             else:
-                target_time_naive = target_time
+                target_time_naive = _target_time
                 cand_time_naive = cand_time
-            if abs(cand_time_naive - target_time_naive) > TIME_DELTA:
+            time_diff = abs(cand_time_naive - target_time_naive)
+            if time_diff > TIME_DELTA:
+                if debug:
+                    print(f"    [DEBUG] {candidate}: time diff {time_diff} exceeds limit ({_target_time} vs {cand_time})", file=sys.stderr)
                 return None
             file_camera = meta['Camera Make'].strip().lower()
-            camera_ok = not csv_camera or not file_camera or csv_camera in file_camera or file_camera in csv_camera
+            camera_ok = not _csv_camera or not file_camera or _csv_camera in file_camera or file_camera in _csv_camera
             if not camera_ok:
+                if debug:
+                    print(f"    [DEBUG] {candidate}: camera mismatch (csv={_csv_camera!r}, file={file_camera!r})", file=sys.stderr)
                 return None
+            if debug:
+                print(f"    [DEBUG] {candidate}: PASS — time_diff={time_diff}, camera={file_camera!r}, size={meta['Width']}x{meta['Height']}", file=sys.stderr)
             return {
                 'path': candidate,
                 'meta': meta,
                 'raw': is_raw_file(candidate),
-                'camera_score': 2 if csv_camera and file_camera and csv_camera == file_camera else 1 if csv_camera in file_camera or file_camera in csv_camera else 0,
+                'camera_score': 2 if _csv_camera and file_camera and _csv_camera == file_camera
+                                else 1 if _csv_camera in file_camera or file_camera in _csv_camera
+                                else 0,
                 'resolution': meta['Width'] * meta['Height']
             }
 
         scored = list(filter(None, (score(c) for c in candidates)))
 
-        exact_matches = [s for s in scored if s['meta']['Width'] == int(row['Width']) and s['meta']['Height'] == int(row['Height'])]
+        exact_matches = [s for s in scored if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
+
+        if debug:
+            print(f"  scored={len(scored)}, exact_matches={len(exact_matches)}", file=sys.stderr)
 
         if len(exact_matches) == 1:
-            relink_commands.append(f'ln "{exact_matches[0]["path"]}" "{original_path}"')
+            cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
+            relink_commands.append(cmd)
         elif len(exact_matches) > 1:
             sorted_matches = sorted(exact_matches, key=lambda x: (-x['raw'], -x['camera_score'], -x['resolution']))
             best = sorted_matches[0]
+            cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
             relink_commands.append(f'# Selected best match from {len(sorted_matches)} candidates')
-            relink_commands.append(f'ln "{best["path"]}" "{original_path}"')
+            relink_commands.append(cmd)
             for alt in sorted_matches[1:]:
                 relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
         elif scored:
             resolution_sorted = sorted(scored, key=lambda x: (-x['raw'], -x['camera_score'], -x['resolution']))
             best = resolution_sorted[0]
+            cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
             resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
-            resolution_mismatches.append(f'ln "{best["path"]}" "{original_path}"')
+            resolution_mismatches.append(cmd)
             for alt in resolution_sorted[1:]:
                 resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
         else:
+            if debug:
+                print(f"  → no scored candidates passed filters", file=sys.stderr)
             still_missing.append(row)
 
         if i % 100 == 0 or i == total:
             print(f"Processed {i}/{total} rows...", file=sys.stderr)
 
-    with open("relink_good_matches.sh", "w") as f:
-        f.write("#!/bin/bash\n")
+    # Write relink_good_matches.sh
+    with open_output(relink_path, append_outputs) as f:
         for cmd in relink_commands:
             f.write(cmd + "\n")
 
-    with open("resolution_mismatch.sh", "w") as f:
-        f.write("#!/bin/bash\n")
+    # Write resolution_mismatch.sh
+    with open_output(mismatch_path, append_outputs) as f:
         for line in resolution_mismatches:
-            f.write(f"{line}\n")
+            f.write(line + "\n")
 
+    # Write Still_Missing_Photos.csv
     still_missing_df = pd.DataFrame(still_missing)
-    still_missing_df.to_csv("Still_Missing_Photos.csv", index=False)
+    if append_outputs and still_missing_path.exists():
+        still_missing_df.to_csv(still_missing_path, mode="a", index=False, header=False)
+    else:
+        still_missing_df.to_csv(still_missing_path, index=False)
 
     print("\nSummary:", file=sys.stderr)
     print(f"  Relink commands generated: {len(relink_commands)}", file=sys.stderr)
     print(f"  Resolution mismatches: {len(resolution_mismatches)}", file=sys.stderr)
     print(f"  Still missing: {len(still_missing)}", file=sys.stderr)
-    print("\nDone. Outputs: relink_good_matches.sh, resolution_mismatch.sh, Still_Missing_Photos.csv")
+    print(f"\nDone. Outputs written to: {out_dir}/")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and relink missing photos by matching metadata.")
     parser.add_argument("csv_filename", help="Path to the CSV file containing missing photos metadata.")
     parser.add_argument(
         "--search-root",
-        required=True,
-        help="Root directory to search for candidate photo files (e.g. /Volumes/Ladyhawke or /Volumes/Photos).",
+        default=None,
+        help="Root directory to search for candidate photo files. Required unless --mdfind is specified.",
+    )
+    parser.add_argument(
+        "--mdfind",
+        action="store_true",
+        help="Use macOS Spotlight (mdfind) to find candidates instead of walking the directory tree. "
+             "Makes --search-root optional (but it can still be used to constrain the search).",
+    )
+    parser.add_argument(
+        "--copy-across-volumes",
+        action="store_true",
+        help="When a candidate is on a different volume than the target, emit a 'cp' command instead of 'ln'.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory where output files will be written. Defaults to current directory.",
+    )
+    parser.add_argument(
+        "--skip-rows",
+        type=int,
+        default=0,
+        help="Skip this many rows from the top of the CSV before processing.",
+    )
+    parser.add_argument(
+        "--rows-to-process",
+        type=int,
+        default=None,
+        help="Process at most this many rows (applied after --skip-rows).",
+    )
+    parser.add_argument(
+        "--append-outputs",
+        action="store_true",
+        help="Append to existing output files instead of overwriting them.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print full candidate match details and rejection reasons. Auto-enabled when --test-n < 20.",
     )
     parser.add_argument("--test-n", type=int, help="Run script on a random sample of N rows for testing.")
     parser.add_argument("--exclude-sources", nargs='*', help="Paths to exclude as candidate sources.")
     parser.add_argument("--exclude-targets", nargs='*', help="Paths to exclude from processing as missing targets.")
     args = parser.parse_args()
-    main(args.csv_filename, args.search_root, args.test_n, args.exclude_sources, args.exclude_targets)
+
+    # Validate: search-root required unless --mdfind
+    if not args.mdfind and args.search_root is None:
+        parser.error("--search-root is required unless --mdfind is specified.")
+
+    # Auto-enable debug for small test runs
+    debug = args.debug or (args.test_n is not None and args.test_n < 20)
+
+    main(
+        csv_filename=args.csv_filename,
+        search_root=args.search_root,
+        test_n=args.test_n,
+        exclude_sources=args.exclude_sources,
+        exclude_targets=args.exclude_targets,
+        use_mdfind=args.mdfind,
+        copy_across_volumes=args.copy_across_volumes,
+        output_dir=args.output_dir,
+        skip_rows=args.skip_rows,
+        rows_to_process=args.rows_to_process,
+        append_outputs=args.append_outputs,
+        debug=debug,
+    )
