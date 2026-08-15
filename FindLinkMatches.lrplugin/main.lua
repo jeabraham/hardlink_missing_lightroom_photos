@@ -29,13 +29,16 @@ local function compareTimestamps(t1, t2)
     return delta <= TIME_DELTA
 end
 
-local function isPhotoMissing(photo)
-	local path = photo:getRawMetadata("path")
-	return path and not LrFileUtils.exists(path)
+local function isPhotoPresent(photo)
+    local ok, available = pcall(function()
+        return photo:checkPhotoAvailability()
+    end)
+
+    return ok and available == true
 end
 
-local function isPhotoPresent(photo)
-    return not isPhotoMissing(photo)
+local function isPhotoMissing(photo)
+    return not isPhotoPresent(photo)
 end
 
 local function findAndCompareMissingPhotos()
@@ -62,6 +65,7 @@ local function findAndCompareMissingPhotos()
         local fileName = photo:getFormattedMetadata("fileName") or "Untitled"
         progressScope:setCaption("Checking " .. index .. " of " .. totalPhotos .. ": " .. fileName)
         progressScope:setPortionComplete(index - 1, totalPhotos)
+        LrTasks.yield()
 
         if isPhotoMissing(photo) then
             local nameWithoutExt = fileName:match("(.+)%..+$") or fileName
@@ -70,6 +74,9 @@ local function findAndCompareMissingPhotos()
             local width = photo:getRawMetadata("width")
             local height = photo:getRawMetadata("height")
             local missingPhotoPath = photo:getRawMetadata("path")
+
+            progressScope:setCaption("Searching catalog for " .. index .. " of " .. totalPhotos .. ": " .. fileName)
+            LrTasks.yield()
 
             local candidates = catalog:findPhotos({
                 searchDesc = {
@@ -85,7 +92,14 @@ local function findAndCompareMissingPhotos()
             local matches = {}
             local possibles = {}
 
+            progressScope:setCaption("Comparing candidates for " .. index .. " of " .. totalPhotos .. ": " .. fileName)
+            LrTasks.yield()
+
             for _, candidate in ipairs(candidates) do
+                if progressScope:isCanceled() then
+                    break
+                end
+
                 if candidate ~= photo and isPhotoPresent(candidate) then
                     local cTime = candidate:getRawMetadata("dateTimeOriginal")
                     local cCamera = candidate:getFormattedMetadata("cameraModel") or ""
@@ -113,10 +127,7 @@ local function findAndCompareMissingPhotos()
         end
 
         progressScope:setPortionComplete(index, totalPhotos)
-
-        if index % 10 == 0 then
-            LrTasks.yield()
-        end
+        LrTasks.yield()
     end
 
     progressScope:done()
