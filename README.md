@@ -265,6 +265,30 @@ The summary counts each input photo exactly once in its primary outcome category
 `Still missing`).  Alternate candidates and comment lines are counted separately so
 the total primary outcomes always equals the number of photos processed.
 
+### Step 2d — Gather recommended import files into one directory
+
+For rows in `import_other_formats.csv` and `import_same_format_higher_resolution.csv`,
+use this helper to gather each `new_file` into an import directory before using
+Lightroom's normal Import dialog:
+
+```bash
+python3 gather_import_files.py import_other_formats.csv \
+    --copy-across-volumes false \
+    --tempdir /path/to/importdir
+```
+
+- Default source column is `new_file`; override with `--column-name`.
+- Same filesystem/volume: creates a hard link in `--tempdir`.
+- Different volume: copies only when `--copy-across-volumes true`; otherwise skips.
+- Original source files are never modified, moved, renamed, or deleted.
+- Filename collisions are handled deterministically (`name__1.ext`, `name__2.ext`, ...);
+  existing files are never silently overwritten.
+
+When cross-volume copies are disabled and rows are skipped, the script writes a CSV
+containing those remaining rows (all original columns preserved), by default:
+
+`<input_stem>_remaining_other_volume.csv`
+
 #### Interrupt and resume
 
 If the script is interrupted with Ctrl-C it flushes all output files and prints a
