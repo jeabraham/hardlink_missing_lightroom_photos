@@ -13,12 +13,47 @@ See [DESIGN.md](DESIGN.md) for the full rationale, background, and planned futur
 ## Recovery workflow
 
 ```
+0. Pre-process: identify and remove redundant catalog entries  ← Check For Same or Better (Lightroom plugin)
 1. Export missing-photo paths from Lightroom (see below)
 2. Recover originals from Time Machine           ← recover_from_timemachine.py
 3. Re-run Lightroom "Find All Missing Photos"
-4. Find identical copies elsewhere and hardlink  ← FindLinkMatches plugin + relink_missing_photos.py
+4. Find identical copies elsewhere and hardlink  ← relink_missing_photos.py
 5. Handle remaining gaps manually
 ```
+
+---
+
+## Step 0 — Pre-processing: identify and remove redundant catalog entries
+
+Before starting the main recovery workflow you may want to clean up catalog entries
+that are no longer needed.  A common situation: you previously exported a folder of
+**smart previews** (lower-resolution safety copies) called, for example,
+`downloaded-smart-previews`.  Many of those entries may now be redundant because:
+
+- the higher-resolution original already exists elsewhere in the catalog, or
+- you copied the emergency copy back into its proper folder.
+
+In these cases there is no value in keeping the missing-entry; you can simply delete
+it from the catalog.
+
+**Plugin:** `FindLinkMatches.lrplugin`
+
+1. Select all photos in the folder you want to clean up (e.g. `downloaded-smart-previews`).
+2. Run **Library → Plug-in Extras → Check For Same or Better**.
+
+The plugin searches the active catalog for non-missing photos whose:
+- filename stem matches (extension-agnostic — smart-preview JPEGs match original ORF/NEF/etc.),
+- capture timestamp is within 5 minutes,
+- camera model matches, and
+- resolution is the same or higher.
+
+Photos that meet these criteria are added to a special collection called
+**"Has Same Or Better"**.  You can then review that collection and delete the
+redundant catalog entries manually — especially entries that are already missing,
+since there is no need to keep a catalog record pointing to a missing file when a
+same-or-better image already exists in a proper folder.
+
+A debug log is written to `~/Desktop/check_same_or_better_debug.log`.
 
 ---
 
@@ -158,40 +193,7 @@ After recovering everything possible from Time Machine, re-run
 **Library → Find All Missing Photos** in Lightroom, then export a fresh CSV
 using **Write CSV File for Photos**.
 
-Step 2a and 2b are **complementary tools**, not the same implementation in two
-languages:
-
-- **2a (Lua plugin)** queries Lightroom's active catalog directly.
-- **2b (Python script)** scans files under `/Volumes/Ladyhawke` and evaluates
-  EXIF on-disk via `exiftool`.
-
-Use 2a when you want fast catalog-internal candidate discovery from Lightroom.
-Use 2b when you want a broader filesystem pass and more explicit ranking/output
-files for review.
-
-### Step 2a — Find candidates with the Lightroom plugin
-
-**Plugin:** `FindLinkMatches.lrplugin`  
-**Status:** Implemented; not yet fully end-to-end tested.
-
-Install the plugin via Lightroom's Plugin Manager.  With the
-`Missing Photographs` collection selected, run:
-
-**Library → Plug-in Extras → Find Matches to Missing Photos**
-
-The plugin searches the active catalog for non-missing photos whose filename stem,
-capture timestamp (within 5 minutes), camera model, and dimensions all match the
-missing photo.  It writes three files to the Desktop:
-
-| File | Contents |
-|------|----------|
-| `link_missing.sh` | `ln` commands for unambiguous single matches |
-| `ambiguous_match.csv` | Missing paths with multiple candidate matches |
-| `possible_matches.txt` | Weaker candidates where metadata partially matches |
-
-Review these files before running anything.
-
-### Step 2b — Refine candidates with Python (optional)
+### Step 2a — Find candidates with Python
 
 **Script:** `relink_missing_photos.py`  
 **Status:** Implemented; not yet fully end-to-end tested.  
@@ -237,23 +239,15 @@ The summary counts each input photo exactly once in its primary outcome category
 `Still missing`).  Alternate candidates and comment lines are counted separately so
 the total primary outcomes always equals the number of photos processed.
 
-### Comparison
+> **Note — pure Lua alternative (work in progress):** There is an experimental
+> `FindLinkMatches.lrplugin` function called **Find Matches to Missing Photos**
+> (`main.lua`) that attempts to perform a similar search entirely inside Lightroom,
+> without needing a CSV or `exiftool`.  It queries the active catalog directly and
+> writes `ln` shell commands to the Desktop.  This approach is simpler and could be
+> useful for other users, but **it does not work reliably yet**.  The Python script
+> (`relink_missing_photos.py`) is the currently recommended path.
 
-Step 2a and 2b are **complementary tools**, very similar but not 
-quite the same implementation:
-
-- **2a (Lua plugin)** queries Lightroom's active catalog directly.
-- **2b (Python script)** scans files under `/Volumes/Ladyhawke` and evaluates
-  EXIF on-disk via `exiftool`.
-
-For a detailed explanation of how these two approaches differ, see
-[MISSING_LUA_VS_PYTHON.md](MISSING_LUA_VS_PYTHON.md).
-
-Use 2a when you want fast catalog-internal candidate discovery from Lightroom.
-Use 2b when you want a broader filesystem pass and more explicit ranking/output
-files for review.
-
-### Step 2c — Compare metadata for a specific file
+### Step 2b — Compare metadata for a specific file
 
 ```bash
 python3 compare_metadata.py data/Missing_Photos.csv <expected_filename> <candidate_path>
@@ -263,7 +257,7 @@ Loads metadata from the CSV for `<expected_filename>` and compares it against
 `<candidate_path>` using exiftool.  Useful for manually verifying a specific
 candidate before linking.
 
-### Step 2d — Apply the hardlinks
+### Step 2c — Apply the hardlinks
 
 Review `relink_good_matches.sh`, then run it:
 
@@ -293,9 +287,10 @@ additional disk space and without modifying the Lightroom catalog.
 ## Repository layout
 
 ```
-FindLinkMatches.lrplugin/   Lightroom plugin — find catalog matches for missing photos
+FindLinkMatches.lrplugin/   Lightroom plugin — catalog-based tools for missing/redundant photos
   Info.lua                  Plugin metadata
-  main.lua                  Step 2a: find catalog matches + link command suggestions
+  main.lua                  WIP: find catalog matches + link command suggestions (not yet working)
+  check_same_or_better.lua  Step 0: add photos that have a same-or-better copy to a collection
   write_csv.lua             Step 1/2 input export: Missing_Photos.csv with metadata
 
 recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine

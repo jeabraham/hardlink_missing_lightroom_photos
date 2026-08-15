@@ -1,5 +1,11 @@
 # Lua Plugin vs Python Relinking Script
 
+> **Status note:** The `main.lua` Lightroom plugin function described here is a
+> work-in-progress and does not currently work reliably end-to-end.  It is
+> documented here because the approach is simpler and could be useful to other
+> users who extend or adapt it.  For practical recovery work, use
+> `relink_missing_photos.py` (see README.md).
+
 This project includes two tools that appear similar at first glance:
 
 - `FindLinkMatches.lrplugin/main.lua`
