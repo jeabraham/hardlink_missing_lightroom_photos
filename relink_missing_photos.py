@@ -4,6 +4,7 @@ import shlex
 import argparse
 import sys
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import pandas as pd
@@ -18,12 +19,16 @@ TZ_MISMATCH_MAX = timedelta(hours=26)         # max tz offset to consider
 RAW_EXTENSIONS = {".dng", ".orf", ".arw", ".cr2", ".nef", ".rw2", ".raf", ".pef"}
 IGNORED_CANDIDATE_EXTENSIONS = {".xmp"}
 
-def get_exif_data_exiftool(image_path):
+def get_exif_data_exiftool(image_path, verbose_debug=False):
+    if verbose_debug:
+        print(f"    [VERBOSE] exiftool starting: {image_path}  ({time.strftime('%H:%M:%S')})", file=sys.stderr)
     try:
         result = subprocess.run(
             ["exiftool", "-Make", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", image_path],
             capture_output=True, text=True, check=True, timeout=30
         )
+        if verbose_debug:
+            print(f"    [VERBOSE] exiftool done: {image_path}  ({time.strftime('%H:%M:%S')})", file=sys.stderr)
         data = {}
         for line in result.stdout.strip().splitlines():
             if ':' not in line:
@@ -43,7 +48,7 @@ def get_exif_data_exiftool(image_path):
         print(f"❌ Error running exiftool on {image_path}: {e.stderr}", file=sys.stderr)
         return None
 
-def parse_datetime(value):
+def parse_datetime(value, verbose_debug=False):
     try:
         if value is None:
             return None
@@ -64,7 +69,11 @@ def parse_datetime(value):
             dt_str = dt_str[:19]
             return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
         # Everything else — strip any tz info dateparser may attach
+        if verbose_debug:
+            print(f"    [VERBOSE] dateparser.parse starting on: {dt_str!r}  ({time.strftime('%H:%M:%S')})", file=sys.stderr)
         result = dateparser.parse(dt_str)
+        if verbose_debug:
+            print(f"    [VERBOSE] dateparser.parse done: {result}  ({time.strftime('%H:%M:%S')})", file=sys.stderr)
         return result.replace(tzinfo=None) if result is not None else None
     except Exception as e:
         print(f"⚠️ Failed to parse datetime: {value} ({e})", file=sys.stderr)
@@ -85,19 +94,26 @@ def index_files_by_stem(search_root, exclude_sources):
     print(f"Indexed {sum(len(v) for v in index.values())} files.\n", file=sys.stderr)
     return index
 
-def find_candidates_mdfind(stem, search_root=None, exclude_sources=None):
+def find_candidates_mdfind(stem, search_root=None, exclude_sources=None, verbose_debug=False):
     """Use macOS Spotlight (mdfind) to locate files matching stem, then filter."""
     cmd = ["mdfind", "-name", stem]
     if search_root:
         cmd += ["-onlyin", str(search_root)]
+    if verbose_debug:
+        print(f"    [VERBOSE] mdfind starting: {' '.join(cmd)}  ({time.strftime('%H:%M:%S')})", file=sys.stderr)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        print(f"⚠️ mdfind timed out for stem={stem!r}, skipping", file=sys.stderr)
+        return []
     except subprocess.CalledProcessError as e:
         print(f"❌ mdfind error for {stem}: {e.stderr}", file=sys.stderr)
         return []
     except FileNotFoundError:
         print("❌ mdfind not found — are you running on macOS?", file=sys.stderr)
         return []
+    if verbose_debug:
+        print(f"    [VERBOSE] mdfind done: {stem!r}, {len(result.stdout.strip().splitlines())} raw results  ({time.strftime('%H:%M:%S')})", file=sys.stderr)
     candidates = []
     for line in result.stdout.strip().splitlines():
         line = line.strip()
@@ -197,7 +213,8 @@ def _print_interrupt_resume(csv_filename, last_completed_row, skip_rows,
 def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
          exclude_targets=None, use_mdfind=False, copy_across_volumes=False,
          output_dir=None, skip_rows=0, rows_to_process=None,
-         append_outputs=False, debug=False, allow_timezone_mismatches=False):
+         append_outputs=False, debug=False, allow_timezone_mismatches=False,
+         verbose_debug=False):
 
     out_dir = Path(output_dir) if output_dir else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -314,14 +331,17 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             stem = Path(filename).stem.lower()
             target_ext = Path(filename).suffix.lower()
 
+            if debug:
+                print(f"\n[DEBUG] Row {i}: {original_path}", file=sys.stderr)
+                print(f"  stem={stem}", file=sys.stderr)
+
             if use_mdfind:
-                candidates = find_candidates_mdfind(stem, search_root, exclude_sources)
+                candidates = find_candidates_mdfind(stem, search_root, exclude_sources, verbose_debug=verbose_debug)
             else:
                 candidates = file_index.get(stem, [])
 
             if debug:
-                print(f"\n[DEBUG] Row {i}: {original_path}", file=sys.stderr)
-                print(f"  stem={stem}, candidates found={len(candidates)}", file=sys.stderr)
+                print(f"  candidates found={len(candidates)}", file=sys.stderr)
 
             if not candidates:
                 if debug:
@@ -339,7 +359,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
                 last_completed_row = skip_rows + i
                 continue
 
-            target_time = parse_datetime(row['Date/Time Original (Capture)'])
+            target_time = parse_datetime(row['Date/Time Original (Capture)'], verbose_debug=verbose_debug)
             if not target_time:
                 if debug:
                     print(f"  → could not parse target datetime: {row.get('Date/Time Original (Capture)')}", file=sys.stderr)
@@ -353,12 +373,12 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             target_h = int(row['Height'])
 
             def score(candidate, _target_time=target_time, _csv_camera=csv_camera):
-                meta = get_exif_data_exiftool(candidate)
+                meta = get_exif_data_exiftool(candidate, verbose_debug=verbose_debug)
                 if not meta:
                     if debug:
                         print(f"    [DEBUG] {candidate}: exiftool returned no data", file=sys.stderr)
                     return None
-                cand_time = parse_datetime(meta['DateTime'])
+                cand_time = parse_datetime(meta['DateTime'], verbose_debug=verbose_debug)
                 if not cand_time:
                     if debug:
                         print(f"    [DEBUG] {candidate}: could not parse candidate datetime: {meta['DateTime']}", file=sys.stderr)
@@ -626,6 +646,12 @@ if __name__ == "__main__":
         help="Print full candidate match details and rejection reasons. Auto-enabled when --test-n < 20.",
     )
     parser.add_argument(
+        "--verbose-debug",
+        action="store_true",
+        help="Print timestamped trace messages immediately before and after each blocking call "
+             "(mdfind, exiftool, dateparser). Use to pinpoint hangs.",
+    )
+    parser.add_argument(
         "--allow-timezone-mismatches",
         action="store_true",
         help="Accept candidates whose capture time differs by an even half-hour offset (±30 min granularity) "
@@ -642,6 +668,7 @@ if __name__ == "__main__":
 
     # Auto-enable debug for small test runs
     debug = args.debug or (args.test_n is not None and args.test_n < 20)
+    verbose_debug = args.verbose_debug
 
     main(
         csv_filename=args.csv_filename,
@@ -657,4 +684,5 @@ if __name__ == "__main__":
         append_outputs=args.append_outputs,
         debug=debug,
         allow_timezone_mismatches=args.allow_timezone_mismatches,
+        verbose_debug=verbose_debug,
     )
