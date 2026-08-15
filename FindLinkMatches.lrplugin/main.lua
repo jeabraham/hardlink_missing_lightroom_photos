@@ -121,18 +121,31 @@ local function findAndCompareMissingPhotos()
                 .. ", width=" .. tostring(width)
                 .. ", height=" .. tostring(height))
 
-            setDebugCaption(progressScope, totalPhotos, "Searching catalog for filename containing: " .. nameWithoutExt)
-            debugLog(debugPath, "Before catalog:findPhotos")
+            setDebugCaption(progressScope, totalPhotos, "Searching catalog for: " .. fileName)
+            debugLog(debugPath, "Before catalog:findPhotos (exact)")
 
             local candidates = catalog:findPhotos({
                 searchDesc = {
                     criteria = "filename",
-                    operation = "contains",
-                    value = nameWithoutExt,
+                    operation = "=",
+                    value = fileName,
                 }
             })
 
-            debugLog(debugPath, "After catalog:findPhotos. candidateCount=" .. tostring(candidates and #candidates or "nil"))
+            debugLog(debugPath, "After catalog:findPhotos (exact). candidateCount=" .. tostring(candidates and #candidates or "nil"))
+
+            if candidates and #candidates == 0 then
+                debugLog(debugPath, "No exact match; falling back to stem contains search.")
+                setDebugCaption(progressScope, totalPhotos, "Fallback stem search for: " .. nameWithoutExt)
+                candidates = catalog:findPhotos({
+                    searchDesc = {
+                        criteria = "filename",
+                        operation = "contains",
+                        value = nameWithoutExt,
+                    }
+                })
+                debugLog(debugPath, "After catalog:findPhotos (contains). candidateCount=" .. tostring(candidates and #candidates or "nil"))
+            end
 
             if not candidates then
                 debugLog(debugPath, "Skipping photo because catalog search returned nil.")
