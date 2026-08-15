@@ -201,6 +201,7 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
 
     relink_path = out_dir / "relink_good_matches.sh"
     mismatch_path = out_dir / "resolution_mismatch.sh"
+    higher_resolution_path = out_dir / "higher_resolution.sh"
     still_missing_path = out_dir / "Still_Missing_Photos.csv"
     import_other_formats_path = out_dir / "import_other_formats.csv"
     import_same_format_higher_res_path = out_dir / "import_same_format_higher_resolution.csv"
@@ -416,8 +417,9 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             elif same_type_sorted:
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
+                higher_res_tag = " HIGHER_RESOLUTION" if best['resolution'] > target_w * target_h else ""
                 resolution_mismatches.append(
-                    f'# Resolution mismatch (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
+                    f'# Resolution mismatch{higher_res_tag} (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
                 )
                 resolution_mismatches.append(cmd)
                 emitted_resolution_mismatch = True
@@ -459,8 +461,9 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
             if same_type_sorted and not exact_matches and not emitted_resolution_mismatch:
                 best = same_type_sorted[0]
                 cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
+                higher_res_tag = " HIGHER_RESOLUTION" if best['resolution'] > target_w * target_h else ""
                 resolution_mismatches.append(
-                    f'# Resolution mismatch (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
+                    f'# Resolution mismatch{higher_res_tag} (LR:{target_w}x{target_h}): {original_path} -> {format_candidate_meta(best)}'
                 )
                 resolution_mismatches.append(cmd)
                 resolution_match_count += 1
@@ -492,6 +495,21 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     # Write resolution_mismatch.sh
     with open_output(mismatch_path, append_outputs) as f:
         for line in resolution_mismatches:
+            f.write(line + "\n")
+
+    # Write higher_resolution.sh by extracting HIGHER_RESOLUTION entries from resolution_mismatches
+    higher_resolution_lines = []
+    i = 0
+    while i < len(resolution_mismatches):
+        if 'HIGHER_RESOLUTION' in resolution_mismatches[i]:
+            higher_resolution_lines.append(resolution_mismatches[i])
+            if i + 1 < len(resolution_mismatches):
+                higher_resolution_lines.append(resolution_mismatches[i + 1])
+            i += 2
+        else:
+            i += 1
+    with open_output(higher_resolution_path, append_outputs) as f:
+        for line in higher_resolution_lines:
             f.write(line + "\n")
 
     # Write Still_Missing_Photos.csv
@@ -529,6 +547,8 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     print(f"  Relink commands (alternate):       {relink_alt_count}", file=sys.stderr)
     print(f"  Resolution mismatches (match):     {resolution_match_count}", file=sys.stderr)
     print(f"  Resolution mismatches (alternate): {resolution_alt_count}", file=sys.stderr)
+    higher_resolution_count = len(higher_resolution_lines) // 2
+    print(f"  Higher resolution matches:         {higher_resolution_count}", file=sys.stderr)
     print(f"  Import other formats:              {import_other_formats_primary_count} photos ({len(import_other_formats)} candidates)", file=sys.stderr)
     print(f"  Import higher res same format:     {len(import_same_format_higher_res)}", file=sys.stderr)
     print(f"  Still missing:                     {len(still_missing)}", file=sys.stderr)

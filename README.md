@@ -226,7 +226,8 @@ Outputs (written to the current working directory):
 | File | Contents |
 |------|----------|
 | `relink_good_matches.sh` | `ln` commands for confirmed matches (exact resolution). Best match is the active command; alternate candidates appear as `# Alt:` comment lines. |
-| `resolution_mismatch.sh` | Best-guess links where resolution differs (same file extension/type only). Each entry shows the Lightroom-known resolution as `LR:WxH` in the comment — note that Lightroom sometimes only knows the Smart Preview resolution, so the matched file on disk may have a *higher* resolution than what Lightroom reports, which is normal and desirable. Comment lines include alternate candidates prefixed `# Alt:`. To find cases where the matched file is higher resolution than Lightroom's record, filter for lines where the candidate dimensions exceed the `LR:` dimensions. |
+| `resolution_mismatch.sh` | Best-guess links where resolution differs (same file extension/type only). Each entry shows the Lightroom-known resolution as `LR:WxH` in the comment — note that Lightroom sometimes only knows the Smart Preview resolution, so the matched file on disk may have a *higher* resolution than what Lightroom reports, which is normal and desirable. Comment lines include alternate candidates prefixed `# Alt:`. Entries where the candidate dimensions exceed the `LR:` dimensions are tagged with `HIGHER_RESOLUTION` in the comment. |
+| `higher_resolution.sh` | Automatically extracted subset of `resolution_mismatch.sh` containing only entries where the matched file is higher resolution than Lightroom's record (tagged `HIGHER_RESOLUTION`). These are particularly safe to apply — the matched file likely has more detail than the Smart Preview Lightroom knows about. This file is generated automatically; you can also regenerate it manually with `grep -A 1 'HIGHER_RESOLUTION' resolution_mismatch.sh > higher_resolution.sh`. |
 | `import_other_formats.csv` | Ranked cross-format candidates for future import/relink handling (only when no same-extension candidate was found) |
 | `import_same_format_higher_resolution.csv` | Same-extension candidates whose resolution *exceeds* the matched file that was linked in `relink_good_matches.sh`. This happens when Lightroom only knows the Smart Preview resolution and the relinked file was matched by resolution — but there is another copy of the same format at a higher (likely original) resolution. Columns: `missing_file`, `matched_file`, `new_file`, `lr_width`, `lr_height`, `matched_width`, `matched_height`, `new_width`, `new_height`, `rank`. |
 | `Still_Missing_Photos.csv` | Records with no match found |
@@ -309,7 +310,8 @@ data/
 Still_Missing_Photos.csv    Photos with no match after Phase 2
 ambiguous_matches.csv       Photos with multiple conflicting candidates
 relink_good_matches.sh      Generated hardlink commands (review before running)
-resolution_mismatch.sh      Links where resolution differs; LR:WxH shown per entry
+resolution_mismatch.sh      Links where resolution differs; LR:WxH shown per entry; HIGHER_RESOLUTION tagged
+higher_resolution.sh        Auto-extracted subset of resolution_mismatch.sh for higher-res matches
 import_other_formats.csv    Cross-format candidates (e.g. RAW when LR has JPEG)
 import_same_format_higher_resolution.csv  Same-extension candidates with higher resolution
 setup.env                   pip install commands for Python dependencies
