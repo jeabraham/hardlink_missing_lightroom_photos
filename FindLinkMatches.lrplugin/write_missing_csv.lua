@@ -15,7 +15,11 @@ local function csvEscape(value)
     return '"' .. value .. '"'
 end
 
-local function writeCsvFileForPhotos()
+local function isPhotoMissing(photo)
+    return photo:getRawMetadata("isMissing") == true
+end
+
+local function writeCsvFileForMissingPhotos()
     local photos = catalog:getTargetPhotos()
     if #photos == 0 then
         LrDialogs.message(
@@ -44,30 +48,35 @@ local function writeCsvFileForPhotos()
     f:write(table.concat(columns, ",") .. "\n")
 
     local exported = 0
+    local skippedNonMissing = 0
 
     for _, photo in ipairs(photos) do
-        local path = photo:getRawMetadata("path") or ""
-        local url = photo:getRawMetadata("url") or ""
-        local fileName = photo:getFormattedMetadata("fileName") or ""
-        local captureDate = photo:getRawMetadata("dateTimeOriginal") or ""
-        local width = photo:getRawMetadata("width") or ""
-        local height = photo:getRawMetadata("height") or ""
-        local cameraMake = photo:getFormattedMetadata("cameraMake")
-        if not cameraMake or cameraMake == "" then
-            cameraMake = photo:getFormattedMetadata("cameraModel") or ""
-        end
+        if isPhotoMissing(photo) then
+            local path = photo:getRawMetadata("path") or ""
+            local url = photo:getRawMetadata("url") or ""
+            local fileName = photo:getFormattedMetadata("fileName") or ""
+            local captureDate = photo:getRawMetadata("dateTimeOriginal") or ""
+            local width = photo:getRawMetadata("width") or ""
+            local height = photo:getRawMetadata("height") or ""
+            local cameraMake = photo:getFormattedMetadata("cameraMake")
+            if not cameraMake or cameraMake == "" then
+                cameraMake = photo:getFormattedMetadata("cameraModel") or ""
+            end
 
-        local row = {
-            csvEscape(path),
-            csvEscape(url),
-            csvEscape(fileName),
-            csvEscape(captureDate),
-            csvEscape(width),
-            csvEscape(height),
-            csvEscape(cameraMake),
-        }
-        f:write(table.concat(row, ",") .. "\n")
-        exported = exported + 1
+            local row = {
+                csvEscape(path),
+                csvEscape(url),
+                csvEscape(fileName),
+                csvEscape(captureDate),
+                csvEscape(width),
+                csvEscape(height),
+                csvEscape(cameraMake),
+            }
+            f:write(table.concat(row, ",") .. "\n")
+            exported = exported + 1
+        else
+            skippedNonMissing = skippedNonMissing + 1
+        end
     end
 
     f:close()
@@ -76,7 +85,8 @@ local function writeCsvFileForPhotos()
         "CSV export complete",
         "Wrote " .. exported .. " missing-photo rows to:\n" .. outputPath
             .. "\n\nColumns: Photo, URL, Filename, Date/Time Original (Capture), Width, Height, Camera Make"
+            .. "\nSkipped non-missing selected photos: " .. skippedNonMissing
     )
 end
 
-LrTasks.startAsyncTask(writeCsvFileForPhotos)
+LrTasks.startAsyncTask(writeCsvFileForMissingPhotos)

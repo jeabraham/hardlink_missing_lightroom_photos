@@ -28,6 +28,10 @@ local function compareTimestamps(t1, t2)
     return delta <= TIME_DELTA
 end
 
+local function isPhotoMissing(photo)
+    return photo:getRawMetadata("isMissing") == true
+end
+
 local function findAndCompareMissingPhotos()
     local photos = catalog:getTargetPhotos()
     local relinkPath = LrPathUtils.child(desktop, "link_missing.sh")
@@ -39,7 +43,7 @@ local function findAndCompareMissingPhotos()
     LrFileUtils.delete(possiblePath)
 
     for _, photo in ipairs(photos) do
-        if photo:isMissing() then
+        if isPhotoMissing(photo) then
             local fileName = photo:getFormattedMetadata("fileName")
             local nameWithoutExt = fileName:match("(.+)%..+$")
             local dateTime = photo:getRawMetadata("dateTimeOriginal")
