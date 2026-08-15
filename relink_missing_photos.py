@@ -4,9 +4,11 @@ import argparse
 import sys
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 from dateutil import parser as dateparser
+
+APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 # Constants
 TIME_DELTA = timedelta(minutes=5)
@@ -34,15 +36,30 @@ def get_exif_data_exiftool(image_path):
         print(f"❌ Error running exiftool on {image_path}: {e.stderr}", file=sys.stderr)
         return None
 
-def parse_datetime(dt_str):
+def parse_datetime(value):
     try:
-        dt_str = dt_str.strip()
+        if value is None:
+            return None
+        # Apple/Cocoa timestamp: seconds since 2001-01-01 UTC
+        if isinstance(value, (int, float)):
+            return APPLE_EPOCH + timedelta(seconds=float(value))
+        dt_str = str(value).strip()
+        if not dt_str:
+            return None
+        # Also accept Apple timestamps that arrived as strings
+        try:
+            numeric_value = float(dt_str)
+            return APPLE_EPOCH + timedelta(seconds=numeric_value)
+        except ValueError:
+            pass
+        # EXIF-style datetime
         if ":" in dt_str[:10]:
             dt_str = dt_str[:19]
             return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+        # Everything else
         return dateparser.parse(dt_str)
     except Exception as e:
-        print(f"⚠️ Failed to parse datetime: {dt_str} ({e})", file=sys.stderr)
+        print(f"⚠️ Failed to parse datetime: {value} ({e})", file=sys.stderr)
         return None
 
 def index_files_by_stem(search_root, exclude_sources):
