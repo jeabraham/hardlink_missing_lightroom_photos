@@ -1,5 +1,6 @@
 import os
 import csv
+import shlex
 import argparse
 import sys
 import subprocess
@@ -12,6 +13,8 @@ APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 # Constants
 TIME_DELTA = timedelta(minutes=5)
+TZ_MISMATCH_RESIDUAL = timedelta(minutes=1)  # allowed residual after removing tz offset
+TZ_MISMATCH_MAX = timedelta(hours=26)         # max tz offset to consider
 RAW_EXTENSIONS = {".dng", ".orf", ".arw", ".cr2", ".nef", ".rw2", ".raf", ".pef"}
 
 def get_exif_data_exiftool(image_path):
@@ -56,7 +59,7 @@ def parse_datetime(value):
         if ":" in dt_str[:10]:
             dt_str = dt_str[:19]
             return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-        # Everything else
+        # Everything else — strip any tz info dateparser may attach
         result = dateparser.parse(dt_str)
         return result.replace(tzinfo=None) if result is not None else None
     except Exception as e:
@@ -125,6 +128,18 @@ def make_link_or_copy_command(candidate_path, original_path, copy_across_volumes
 def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
 
+def timezone_offset_match(time_diff):
+    """Return True if time_diff is within TZ_MISMATCH_RESIDUAL of an even half-hour offset
+    (0, 30, 60, 90 … minutes) up to TZ_MISMATCH_MAX.  Covers all real-world timezone
+    offsets including Newfoundland (UTC-3:30) and rare ±30-min zones."""
+    if time_diff > TZ_MISMATCH_MAX:
+        return False
+    total_seconds = time_diff.total_seconds()
+    half_hour_seconds = 1800  # 30 minutes
+    nearest_half_hours = round(total_seconds / half_hour_seconds)
+    residual = abs(total_seconds - nearest_half_hours * half_hour_seconds)
+    return timedelta(seconds=residual) <= TZ_MISMATCH_RESIDUAL
+
 def open_output(path, append):
     """Open a shell-script output file for writing or appending; write shebang only when creating."""
     mode = "a" if append else "w"
@@ -134,10 +149,39 @@ def open_output(path, append):
         f.write("#!/bin/bash\n")
     return f
 
+def _print_interrupt_resume(csv_filename, last_completed_row, skip_rows,
+                             rows_to_process, output_dir, argv):
+    """Print the last completed row and a ready-to-paste resume command to stderr."""
+    print(f"\n⚠️  Interrupted after completing row {last_completed_row} "
+          f"(0-based CSV data row, not counting header).", file=sys.stderr)
+    # Rebuild resume command from original argv, replacing windowing flags
+    skip_flags = {"--skip-rows", "--rows-to-process"}
+    parts = [argv[0]]
+    skip_next = False
+    for arg in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in skip_flags:
+            skip_next = True
+            continue
+        if any(arg.startswith(f + "=") for f in skip_flags):
+            continue
+        if arg == "--append-outputs":
+            continue
+        parts.append(arg)
+    parts += ["--skip-rows", str(last_completed_row), "--append-outputs"]
+    if rows_to_process is not None:
+        remaining = rows_to_process - (last_completed_row - skip_rows)
+        if remaining > 0:
+            parts += ["--rows-to-process", str(remaining)]
+    print("Resume with:", file=sys.stderr)
+    print("  " + " ".join(shlex.quote(p) for p in parts), file=sys.stderr)
+
 def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
          exclude_targets=None, use_mdfind=False, copy_across_volumes=False,
          output_dir=None, skip_rows=0, rows_to_process=None,
-         append_outputs=False, debug=False):
+         append_outputs=False, debug=False, allow_timezone_mismatches=False):
 
     out_dir = Path(output_dir) if output_dir else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -178,119 +222,136 @@ def main(csv_filename, search_root=None, test_n=None, exclude_sources=None,
     total = len(missing_photos_df)
     print(f"Processing {total} rows...\n", file=sys.stderr)
 
-    for i, (_, row) in enumerate(missing_photos_df.iterrows(), 1):
-        original_path = row['Photo']
-        if exclude_targets and any(excl in original_path for excl in exclude_targets):
-            continue
+    last_completed_row = skip_rows  # absolute CSV data row of the last finished row
 
-        filename = Path(original_path).name
-        stem = Path(filename).stem.lower()
+    try:
+        for i, (_, row) in enumerate(missing_photos_df.iterrows(), 1):
+            original_path = row['Photo']
+            if exclude_targets and any(excl in original_path for excl in exclude_targets):
+                continue
 
-        if use_mdfind:
-            candidates = find_candidates_mdfind(stem, search_root, exclude_sources)
-        else:
-            candidates = file_index.get(stem, [])
+            filename = Path(original_path).name
+            stem = Path(filename).stem.lower()
 
-        if debug:
-            print(f"\n[DEBUG] Row {i}: {original_path}", file=sys.stderr)
-            print(f"  stem={stem}, candidates found={len(candidates)}", file=sys.stderr)
+            if use_mdfind:
+                candidates = find_candidates_mdfind(stem, search_root, exclude_sources)
+            else:
+                candidates = file_index.get(stem, [])
 
-        if not candidates:
             if debug:
-                print(f"  → no candidates found", file=sys.stderr)
-            still_missing.append(row)
-            continue
+                print(f"\n[DEBUG] Row {i}: {original_path}", file=sys.stderr)
+                print(f"  stem={stem}, candidates found={len(candidates)}", file=sys.stderr)
 
-        if pd.isna(row.get("Date/Time Original (Capture)")) or pd.isna(row.get("Width")) or pd.isna(row.get("Height")):
-            if debug:
-                print(f"  → missing metadata in CSV row (date/width/height)", file=sys.stderr)
-            still_missing.append(row)
-            continue
-
-        target_time = parse_datetime(row['Date/Time Original (Capture)'])
-        if not target_time:
-            if debug:
-                print(f"  → could not parse target datetime: {row.get('Date/Time Original (Capture)')}", file=sys.stderr)
-            still_missing.append(row)
-            continue
-
-        csv_camera = str(row.get('Camera Make') or '').strip().lower()
-        target_w = int(row['Width'])
-        target_h = int(row['Height'])
-
-        def score(candidate, _target_time=target_time, _csv_camera=csv_camera):
-            meta = get_exif_data_exiftool(candidate)
-            if not meta:
+            if not candidates:
                 if debug:
-                    print(f"    [DEBUG] {candidate}: exiftool returned no data", file=sys.stderr)
-                return None
-            cand_time = parse_datetime(meta['DateTime'])
-            if not cand_time:
+                    print(f"  → no candidates found", file=sys.stderr)
+                still_missing.append(row)
+                last_completed_row = skip_rows + i
+                continue
+
+            if pd.isna(row.get("Date/Time Original (Capture)")) or pd.isna(row.get("Width")) or pd.isna(row.get("Height")):
                 if debug:
-                    print(f"    [DEBUG] {candidate}: could not parse candidate datetime: {meta['DateTime']}", file=sys.stderr)
-                return None
-            if _target_time.tzinfo is None or cand_time.tzinfo is None:
+                    print(f"  → missing metadata in CSV row (date/width/height)", file=sys.stderr)
+                still_missing.append(row)
+                last_completed_row = skip_rows + i
+                continue
+
+            target_time = parse_datetime(row['Date/Time Original (Capture)'])
+            if not target_time:
+                if debug:
+                    print(f"  → could not parse target datetime: {row.get('Date/Time Original (Capture)')}", file=sys.stderr)
+                still_missing.append(row)
+                last_completed_row = skip_rows + i
+                continue
+
+            csv_camera = str(row.get('Camera Make') or '').strip().lower()
+            target_w = int(row['Width'])
+            target_h = int(row['Height'])
+
+            def score(candidate, _target_time=target_time, _csv_camera=csv_camera):
+                meta = get_exif_data_exiftool(candidate)
+                if not meta:
+                    if debug:
+                        print(f"    [DEBUG] {candidate}: exiftool returned no data", file=sys.stderr)
+                    return None
+                cand_time = parse_datetime(meta['DateTime'])
+                if not cand_time:
+                    if debug:
+                        print(f"    [DEBUG] {candidate}: could not parse candidate datetime: {meta['DateTime']}", file=sys.stderr)
+                    return None
                 target_time_naive = _target_time.replace(tzinfo=None)
                 cand_time_naive = cand_time.replace(tzinfo=None)
+                time_diff = abs(cand_time_naive - target_time_naive)
+                tz_adjusted = False
+                if time_diff > TIME_DELTA:
+                    if allow_timezone_mismatches and timezone_offset_match(time_diff):
+                        tz_adjusted = True
+                        if debug:
+                            total_mins = int(time_diff.total_seconds() / 60)
+                            print(f"    [DEBUG] {candidate}: time diff {time_diff} accepted as timezone offset (~{total_mins} min)", file=sys.stderr)
+                    else:
+                        if debug:
+                            print(f"    [DEBUG] {candidate}: time diff {time_diff} exceeds limit ({_target_time} vs {cand_time})", file=sys.stderr)
+                        return None
+                file_camera = meta['Camera Make'].strip().lower()
+                camera_ok = not _csv_camera or not file_camera or _csv_camera in file_camera or file_camera in _csv_camera
+                if not camera_ok:
+                    if debug:
+                        print(f"    [DEBUG] {candidate}: camera mismatch (csv={_csv_camera!r}, file={file_camera!r})", file=sys.stderr)
+                    return None
+                if debug:
+                    tz_note = " (timezone-adjusted)" if tz_adjusted else ""
+                    print(f"    [DEBUG] {candidate}: PASS{tz_note} — time_diff={time_diff}, camera={file_camera!r}, size={meta['Width']}x{meta['Height']}", file=sys.stderr)
+                return {
+                    'path': candidate,
+                    'meta': meta,
+                    'raw': is_raw_file(candidate),
+                    'tz_adjusted': tz_adjusted,
+                    'camera_score': 2 if _csv_camera and file_camera and _csv_camera == file_camera
+                                    else 1 if _csv_camera in file_camera or file_camera in _csv_camera
+                                    else 0,
+                    'resolution': meta['Width'] * meta['Height']
+                }
+
+            scored = list(filter(None, (score(c) for c in candidates)))
+
+            exact_matches = [s for s in scored if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
+
+            if debug:
+                print(f"  scored={len(scored)}, exact_matches={len(exact_matches)}", file=sys.stderr)
+
+            if len(exact_matches) == 1:
+                cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
+                relink_commands.append(cmd)
+            elif len(exact_matches) > 1:
+                sorted_matches = sorted(exact_matches, key=lambda x: (x['tz_adjusted'], -x['raw'], -x['camera_score'], -x['resolution']))
+                best = sorted_matches[0]
+                cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
+                relink_commands.append(f'# Selected best match from {len(sorted_matches)} candidates')
+                relink_commands.append(cmd)
+                for alt in sorted_matches[1:]:
+                    relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
+            elif scored:
+                resolution_sorted = sorted(scored, key=lambda x: (x['tz_adjusted'], -x['raw'], -x['camera_score'], -x['resolution']))
+                best = resolution_sorted[0]
+                cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
+                resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
+                resolution_mismatches.append(cmd)
+                for alt in resolution_sorted[1:]:
+                    resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
             else:
-                target_time_naive = _target_time
-                cand_time_naive = cand_time
-            time_diff = abs(cand_time_naive - target_time_naive)
-            if time_diff > TIME_DELTA:
                 if debug:
-                    print(f"    [DEBUG] {candidate}: time diff {time_diff} exceeds limit ({_target_time} vs {cand_time})", file=sys.stderr)
-                return None
-            file_camera = meta['Camera Make'].strip().lower()
-            camera_ok = not _csv_camera or not file_camera or _csv_camera in file_camera or file_camera in _csv_camera
-            if not camera_ok:
-                if debug:
-                    print(f"    [DEBUG] {candidate}: camera mismatch (csv={_csv_camera!r}, file={file_camera!r})", file=sys.stderr)
-                return None
-            if debug:
-                print(f"    [DEBUG] {candidate}: PASS — time_diff={time_diff}, camera={file_camera!r}, size={meta['Width']}x{meta['Height']}", file=sys.stderr)
-            return {
-                'path': candidate,
-                'meta': meta,
-                'raw': is_raw_file(candidate),
-                'camera_score': 2 if _csv_camera and file_camera and _csv_camera == file_camera
-                                else 1 if _csv_camera in file_camera or file_camera in _csv_camera
-                                else 0,
-                'resolution': meta['Width'] * meta['Height']
-            }
+                    print(f"  → no scored candidates passed filters", file=sys.stderr)
+                still_missing.append(row)
 
-        scored = list(filter(None, (score(c) for c in candidates)))
+            last_completed_row = skip_rows + i
+            if i % 100 == 0 or i == total:
+                print(f"Processed {i}/{total} rows...", file=sys.stderr)
 
-        exact_matches = [s for s in scored if s['meta']['Width'] == target_w and s['meta']['Height'] == target_h]
-
-        if debug:
-            print(f"  scored={len(scored)}, exact_matches={len(exact_matches)}", file=sys.stderr)
-
-        if len(exact_matches) == 1:
-            cmd = make_link_or_copy_command(exact_matches[0]['path'], original_path, copy_across_volumes)
-            relink_commands.append(cmd)
-        elif len(exact_matches) > 1:
-            sorted_matches = sorted(exact_matches, key=lambda x: (-x['raw'], -x['camera_score'], -x['resolution']))
-            best = sorted_matches[0]
-            cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
-            relink_commands.append(f'# Selected best match from {len(sorted_matches)} candidates')
-            relink_commands.append(cmd)
-            for alt in sorted_matches[1:]:
-                relink_commands.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
-        elif scored:
-            resolution_sorted = sorted(scored, key=lambda x: (-x['raw'], -x['camera_score'], -x['resolution']))
-            best = resolution_sorted[0]
-            cmd = make_link_or_copy_command(best['path'], original_path, copy_across_volumes)
-            resolution_mismatches.append(f'# Resolution mismatch: {original_path}')
-            resolution_mismatches.append(cmd)
-            for alt in resolution_sorted[1:]:
-                resolution_mismatches.append(f'# Alt: {alt["path"]} ({alt["meta"]["Width"]}x{alt["meta"]["Height"]}, {alt["meta"]["Camera Make"]})')
-        else:
-            if debug:
-                print(f"  → no scored candidates passed filters", file=sys.stderr)
-            still_missing.append(row)
-
-        if i % 100 == 0 or i == total:
-            print(f"Processed {i}/{total} rows...", file=sys.stderr)
+    except KeyboardInterrupt:
+        _print_interrupt_resume(csv_filename, last_completed_row, skip_rows,
+                                rows_to_process, output_dir, sys.argv)
+        sys.exit(130)
 
     # Write relink_good_matches.sh
     with open_output(relink_path, append_outputs) as f:
@@ -361,6 +422,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Print full candidate match details and rejection reasons. Auto-enabled when --test-n < 20.",
     )
+    parser.add_argument(
+        "--allow-timezone-mismatches",
+        action="store_true",
+        help="Accept candidates whose capture time differs by an even half-hour offset (±30 min granularity) "
+             "up to ±26 hours, with a residual within 1 minute. Handles cameras without timezone support.",
+    )
     parser.add_argument("--test-n", type=int, help="Run script on a random sample of N rows for testing.")
     parser.add_argument("--exclude-sources", nargs='*', help="Paths to exclude as candidate sources.")
     parser.add_argument("--exclude-targets", nargs='*', help="Paths to exclude from processing as missing targets.")
@@ -386,4 +453,5 @@ if __name__ == "__main__":
         rows_to_process=args.rows_to_process,
         append_outputs=args.append_outputs,
         debug=debug,
+        allow_timezone_mismatches=args.allow_timezone_mismatches,
     )
