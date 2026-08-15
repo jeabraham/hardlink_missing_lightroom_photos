@@ -43,17 +43,12 @@ local function compareTimestamps(t1, t2, debugPath)
         return false
     end
 
-    local ok1, parsed1 = pcall(function()
-        return LrDate.timeFromIsoDate(t1)
-    end)
+    local parsed1 = LrDate.timeFromIsoDate(t1)
+    local parsed2 = LrDate.timeFromIsoDate(t2)
 
-    local ok2, parsed2 = pcall(function()
-        return LrDate.timeFromIsoDate(t2)
-    end)
-
-    if not ok1 or not ok2 or not parsed1 or not parsed2 then
-        debugLog(debugPath, "Timestamp parse failed. t1=" .. tostring(t1) .. ", ok1=" .. tostring(ok1) .. ", parsed1=" .. tostring(parsed1)
-            .. "; t2=" .. tostring(t2) .. ", ok2=" .. tostring(ok2) .. ", parsed2=" .. tostring(parsed2))
+    if not parsed1 or not parsed2 then
+        debugLog(debugPath, "Timestamp parse failed. t1=" .. tostring(t1) .. ", parsed1=" .. tostring(parsed1)
+            .. "; t2=" .. tostring(t2) .. ", parsed2=" .. tostring(parsed2))
         return false
     end
 
@@ -65,12 +60,9 @@ end
 
 local function isPhotoPresent(photo, debugPath, label)
     debugLog(debugPath, "Checking availability: " .. tostring(label))
-    local ok, available = pcall(function()
-        return photo:checkPhotoAvailability()
-    end)
-
-    debugLog(debugPath, "Availability result for " .. tostring(label) .. ": ok=" .. tostring(ok) .. ", available=" .. tostring(available))
-    return ok and available == true
+    local available = photo:checkPhotoAvailability()
+    debugLog(debugPath, "Availability result for " .. tostring(label) .. ": available=" .. tostring(available))
+    return available == true
 end
 
 local function isPhotoMissing(photo, debugPath, label)
