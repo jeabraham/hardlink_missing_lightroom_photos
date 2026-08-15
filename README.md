@@ -228,6 +228,22 @@ Outputs (written to the current working directory):
 | `resolution_mismatch.sh` | Best-guess links where resolution differs |
 | `Still_Missing_Photos.csv` | Records with no match found |
 
+### Comparison
+
+Step 2a and 2b are **complementary tools**, very similar but not 
+quite the same implementation:
+
+- **2a (Lua plugin)** queries Lightroom's active catalog directly.
+- **2b (Python script)** scans files under `/Volumes/Ladyhawke` and evaluates
+  EXIF on-disk via `exiftool`.
+
+For a detailed explanation of how these two approaches differ, see
+[MISSING_LUA_VS_PYTHON.md](MISSING_LUA_VS_PYTHON.md).
+
+Use 2a when you want fast catalog-internal candidate discovery from Lightroom.
+Use 2b when you want a broader filesystem pass and more explicit ranking/output
+files for review.
+
 ### Step 2c — Compare metadata for a specific file
 
 ```bash
