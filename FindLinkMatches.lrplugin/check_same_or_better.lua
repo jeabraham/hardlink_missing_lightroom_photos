@@ -10,7 +10,6 @@ local LrDialogs = import 'LrDialogs'
 local LrApplication = import 'LrApplication'
 local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
-local LrDate = import 'LrDate'
 local LrProgressScope = import 'LrProgressScope'
 local catalog = LrApplication.activeCatalog()
 local desktop = LrPathUtils.getStandardFilePath("desktop")
@@ -48,16 +47,12 @@ local function compareTimestamps(t1, t2, debugPath)
         return false
     end
 
-    local parsed1 = LrDate.timeFromIsoDate(t1)
-    local parsed2 = LrDate.timeFromIsoDate(t2)
-
-    if not parsed1 or not parsed2 then
-        debugLog(debugPath, "Timestamp parse failed. t1=" .. tostring(t1) .. ", parsed1=" .. tostring(parsed1)
-            .. "; t2=" .. tostring(t2) .. ", parsed2=" .. tostring(parsed2))
+    if type(t1) ~= "number" or type(t2) ~= "number" then
+        debugLog(debugPath, "Timestamp comparison skipped: timestamps are not numeric. t1=" .. tostring(t1) .. ", t2=" .. tostring(t2))
         return false
     end
 
-    local delta = math.abs(parsed1 - parsed2)
+    local delta = math.abs(t1 - t2)
     local matched = delta <= TIME_DELTA
     debugLog(debugPath, "Timestamp comparison: delta=" .. tostring(delta) .. " seconds, matched=" .. tostring(matched))
     return matched
