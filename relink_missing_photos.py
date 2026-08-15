@@ -61,7 +61,7 @@ def index_files_by_stem(search_root, exclude_sources):
 def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
 
-def main(csv_filename, test_n=None, exclude_sources=None, exclude_targets=None):
+def main(csv_filename, search_root, test_n=None, exclude_sources=None, exclude_targets=None):
     try:
         missing_photos_df = pd.read_csv(csv_filename)
     except Exception as e:
@@ -72,7 +72,7 @@ def main(csv_filename, test_n=None, exclude_sources=None, exclude_targets=None):
         print(f"Running test mode with {test_n} random entries...", file=sys.stderr)
         missing_photos_df = missing_photos_df.sample(n=test_n, random_state=42)
 
-    file_index = index_files_by_stem("/Volumes/Ladyhawke", exclude_sources or [])
+    file_index = index_files_by_stem(search_root, exclude_sources or [])
 
     relink_commands = []
     ambiguous_matches = []
@@ -182,8 +182,13 @@ def main(csv_filename, test_n=None, exclude_sources=None, exclude_targets=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and relink missing photos by matching metadata.")
     parser.add_argument("csv_filename", help="Path to the CSV file containing missing photos metadata.")
+    parser.add_argument(
+        "--search-root",
+        required=True,
+        help="Root directory to search for candidate photo files (e.g. /Volumes/Ladyhawke or /Volumes/Photos).",
+    )
     parser.add_argument("--test-n", type=int, help="Run script on a random sample of N rows for testing.")
     parser.add_argument("--exclude-sources", nargs='*', help="Paths to exclude as candidate sources.")
     parser.add_argument("--exclude-targets", nargs='*', help="Paths to exclude from processing as missing targets.")
     args = parser.parse_args()
-    main(args.csv_filename, args.test_n, args.exclude_sources, args.exclude_targets)
+    main(args.csv_filename, args.search_root, args.test_n, args.exclude_sources, args.exclude_targets)
