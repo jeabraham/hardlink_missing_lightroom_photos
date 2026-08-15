@@ -38,7 +38,6 @@ local function writeCsvFileForMissingPhotos()
 
     local columns = {
         "Photo",
-        "URL",
         "Filename",
         "Date/Time Original (Capture)",
         "Width",
@@ -53,7 +52,6 @@ local function writeCsvFileForMissingPhotos()
     for _, photo in ipairs(photos) do
         if isPhotoMissing(photo) then
             local path = photo:getRawMetadata("path") or ""
-            local url = photo:getRawMetadata("url") or ""
             local fileName = photo:getFormattedMetadata("fileName") or ""
             local captureDate = photo:getRawMetadata("dateTimeOriginal") or ""
             local width = photo:getRawMetadata("width") or ""
@@ -65,7 +63,6 @@ local function writeCsvFileForMissingPhotos()
 
             local row = {
                 csvEscape(path),
-                csvEscape(url),
                 csvEscape(fileName),
                 csvEscape(captureDate),
                 csvEscape(width),

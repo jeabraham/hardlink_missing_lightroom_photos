@@ -34,7 +34,6 @@ local function writeCsvFileForPhotos()
 
     local columns = {
         "Photo",
-        "URL",
         "Filename",
         "Date/Time Original (Capture)",
         "Width",
@@ -47,7 +46,6 @@ local function writeCsvFileForPhotos()
 
     for _, photo in ipairs(photos) do
         local path = photo:getRawMetadata("path") or ""
-        local url = photo:getRawMetadata("url") or ""
         local fileName = photo:getFormattedMetadata("fileName") or ""
         local captureDate = photo:getRawMetadata("dateTimeOriginal") or ""
         local width = photo:getRawMetadata("width") or ""
@@ -59,7 +57,6 @@ local function writeCsvFileForPhotos()
 
         local row = {
             csvEscape(path),
-            csvEscape(url),
             csvEscape(fileName),
             csvEscape(captureDate),
             csvEscape(width),
