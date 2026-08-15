@@ -37,8 +37,8 @@ def get_exif_data_exiftool(image_path, verbose_debug=False):
             data[key.strip()] = val.strip()
         return {
             "Camera Make": data.get("Make", ""),
-            "Width": int(data.get("Image Width", "0").replace(" pixels", "")),
-            "Height": int(data.get("Image Height", "0").replace(" pixels", "")),
+            "Width": int(float(data.get("Image Width", "0").replace(" pixels", ""))),
+            "Height": int(float(data.get("Image Height", "0").replace(" pixels", ""))),
             "DateTime": data.get("Date/Time Original", "")
         }
     except subprocess.TimeoutExpired:

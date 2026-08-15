@@ -10,6 +10,10 @@ return {
       file = "main.lua",
     },
     {
+      title = "Check For Same or Better",
+      file = "check_same_or_better.lua",
+    },
+    {
       title = "Write CSV File for Photos",
       file = "write_csv.lua",
     },

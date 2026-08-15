@@ -6,7 +6,6 @@ local LrDialogs = import 'LrDialogs'
 local LrApplication = import 'LrApplication'
 local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
-local LrDate = import 'LrDate'
 local LrProgressScope = import 'LrProgressScope'
 local catalog = LrApplication.activeCatalog()
 local desktop = LrPathUtils.getStandardFilePath("desktop")
@@ -34,7 +33,6 @@ end
 local function setDebugCaption(progressScope, totalPhotos, message)
     if DEBUG_VERBOSE and totalPhotos <= DEBUG_MAX_ECHO_PHOTOS then
         progressScope:setCaption(message)
-        LrTasks.yield()
     end
 end
 
@@ -44,21 +42,12 @@ local function compareTimestamps(t1, t2, debugPath)
         return false
     end
 
-    local ok1, parsed1 = pcall(function()
-        return LrDate.timeFromIsoDate(t1)
-    end)
-
-    local ok2, parsed2 = pcall(function()
-        return LrDate.timeFromIsoDate(t2)
-    end)
-
-    if not ok1 or not ok2 or not parsed1 or not parsed2 then
-        debugLog(debugPath, "Timestamp parse failed. t1=" .. tostring(t1) .. ", ok1=" .. tostring(ok1) .. ", parsed1=" .. tostring(parsed1)
-            .. "; t2=" .. tostring(t2) .. ", ok2=" .. tostring(ok2) .. ", parsed2=" .. tostring(parsed2))
+    if type(t1) ~= "number" or type(t2) ~= "number" then
+        debugLog(debugPath, "Timestamp comparison skipped: timestamps are not numeric. t1=" .. tostring(t1) .. ", t2=" .. tostring(t2))
         return false
     end
 
-    local delta = math.abs(parsed1 - parsed2)
+    local delta = math.abs(t1 - t2)
     local matched = delta <= TIME_DELTA
     debugLog(debugPath, "Timestamp comparison: delta=" .. tostring(delta) .. " seconds, matched=" .. tostring(matched))
     return matched
@@ -66,12 +55,9 @@ end
 
 local function isPhotoPresent(photo, debugPath, label)
     debugLog(debugPath, "Checking availability: " .. tostring(label))
-    local ok, available = pcall(function()
-        return photo:checkPhotoAvailability()
-    end)
-
-    debugLog(debugPath, "Availability result for " .. tostring(label) .. ": ok=" .. tostring(ok) .. ", available=" .. tostring(available))
-    return ok and available == true
+    local available = photo:checkPhotoAvailability()
+    debugLog(debugPath, "Availability result for " .. tostring(label) .. ": available=" .. tostring(available))
+    return available == true
 end
 
 local function isPhotoMissing(photo, debugPath, label)
@@ -135,27 +121,34 @@ local function findAndCompareMissingPhotos()
                 .. ", width=" .. tostring(width)
                 .. ", height=" .. tostring(height))
 
-            setDebugCaption(progressScope, totalPhotos, "Searching catalog for filename containing: " .. nameWithoutExt)
-            debugLog(debugPath, "Before catalog:findPhotos")
+            setDebugCaption(progressScope, totalPhotos, "Searching catalog for: " .. fileName)
+            debugLog(debugPath, "Before catalog:findPhotos (exact)")
 
-            local okFind, candidates = pcall(function()
-                return catalog:findPhotos({
+            local candidates = catalog:findPhotos({
+                searchDesc = {
+                    criteria = "filename",
+                    operation = "=",
+                    value = fileName,
+                }
+            })
+
+            debugLog(debugPath, "After catalog:findPhotos (exact). candidateCount=" .. tostring(candidates and #candidates or "nil"))
+
+            if candidates and #candidates == 0 then
+                debugLog(debugPath, "No exact match; falling back to stem contains search.")
+                setDebugCaption(progressScope, totalPhotos, "Fallback stem search for: " .. nameWithoutExt)
+                candidates = catalog:findPhotos({
                     searchDesc = {
-                        {
-                            criteria = "filename",
-                            operation = "contains",
-                            value = nameWithoutExt,
-                            searchable = true
-                        }
+                        criteria = "filename",
+                        operation = "contains",
+                        value = nameWithoutExt,
                     }
                 })
-            end)
+                debugLog(debugPath, "After catalog:findPhotos (contains). candidateCount=" .. tostring(candidates and #candidates or "nil"))
+            end
 
-            debugLog(debugPath, "After catalog:findPhotos. ok=" .. tostring(okFind)
-                .. ", candidateCount=" .. tostring(candidates and #candidates or "nil"))
-
-            if not okFind or not candidates then
-                debugLog(debugPath, "Skipping photo because catalog search failed: " .. tostring(candidates))
+            if not candidates then
+                debugLog(debugPath, "Skipping photo because catalog search returned nil.")
             else
                 local matches = {}
                 local possibles = {}
@@ -175,8 +168,12 @@ local function findAndCompareMissingPhotos()
                     debugLog(debugPath, "Candidate " .. tostring(candidateIndex) .. " of " .. tostring(#candidates) .. ": " .. candidateLabel)
                     setDebugCaption(progressScope, totalPhotos, "Candidate " .. tostring(candidateIndex) .. " of " .. tostring(#candidates) .. ": " .. candidateFileName)
 
+                    local candidateStem = candidateFileName:match("(.+)%..+$") or candidateFileName
+
                     if candidate == photo then
                         debugLog(debugPath, "Skipping candidate: same Lightroom photo object as selected missing photo.")
+                    elseif candidateStem:lower() ~= nameWithoutExt:lower() then
+                        debugLog(debugPath, "Skipping candidate: stem mismatch. expected=" .. nameWithoutExt .. ", got=" .. candidateStem)
                     elseif not isPhotoPresent(candidate, debugPath, "candidate " .. candidateLabel) then
                         debugLog(debugPath, "Skipping candidate: candidate is not available.")
                     else
@@ -254,18 +251,7 @@ end
 
 local function runWithErrorLogging()
     local debugPath = LrPathUtils.child(desktop, "find_missing_debug.log")
-
-    local ok, err = pcall(function()
-        findAndCompareMissingPhotos()
-    end)
-
-    if not ok then
-        debugLog(debugPath, "FATAL ERROR: " .. tostring(err))
-        LrDialogs.message(
-            "Match search failed.",
-            "A Lua error occurred. Details were written to:\n" .. debugPath .. "\n\n" .. tostring(err)
-        )
-    end
+    findAndCompareMissingPhotos()
 end
 
 LrTasks.startAsyncTask(runWithErrorLogging)
