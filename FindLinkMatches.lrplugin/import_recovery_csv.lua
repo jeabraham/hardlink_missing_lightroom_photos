@@ -14,6 +14,7 @@ local home = LrPathUtils.getStandardFilePath("home")
 local COLLECTION_NAME = "new-files-imported"
 local OLD_REPLACED_COLLECTION_NAME = "old-entries-replaced"
 local OLD_AND_NEW_COLLECTION_NAME = "old-and-new-entries"
+local COLLECTION_FLUSH_INTERVAL_SECONDS = 5 * 60
 
 local function trim(s)
     return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
@@ -274,6 +275,13 @@ local function importPhotosFromRecoveryCsv()
     local importedPhotos = {}
     local oldEntriesReplaced = {}  -- old catalog photos whose new_file was successfully imported
     local oldAndNewPairs = {}      -- {old=photo, new=photo} pairs for old-and-new-entries collection
+    local pendingImportedPhotos = {}
+    local pendingOldEntriesReplaced = {}
+    local pendingOldAndNewPairs = {}
+    local importedCollection = nil
+    local oldReplacedCollection = nil
+    local oldAndNewCollection = nil
+    local lastCollectionFlushAt = os.time()
     local counts = {
         rowsExamined = 0,
         blankPaths = 0,
@@ -282,6 +290,84 @@ local function importPhotosFromRecoveryCsv()
         missingUnreadable = 0,
         failed = 0,
     }
+
+    local function flushPendingCollections(forceFlush)
+        local now = os.time()
+        if not forceFlush and (now - lastCollectionFlushAt) < COLLECTION_FLUSH_INTERVAL_SECONDS then
+            return
+        end
+
+        local flushedSomething = false
+
+        if #pendingImportedPhotos > 0 then
+            flushedSomething = true
+            if not importedCollection then
+                importedCollection = findOrCreateCollection(COLLECTION_NAME, logf)
+            end
+
+            if importedCollection then
+                local addOk, addErr = withCatalogWriteAccess("Add imported photos to " .. COLLECTION_NAME, function()
+                    importedCollection:addPhotos(pendingImportedPhotos)
+                end)
+                if addOk then
+                    pendingImportedPhotos = {}
+                else
+                    logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
+                end
+            else
+                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. COLLECTION_NAME .. "'\n")
+            end
+        end
+
+        if #pendingOldEntriesReplaced > 0 then
+            flushedSomething = true
+            if not oldReplacedCollection then
+                oldReplacedCollection = findOrCreateCollection(OLD_REPLACED_COLLECTION_NAME, logf)
+            end
+
+            if oldReplacedCollection then
+                local addOk, addErr = withCatalogWriteAccess("Add old entries to " .. OLD_REPLACED_COLLECTION_NAME, function()
+                    oldReplacedCollection:addPhotos(pendingOldEntriesReplaced)
+                end)
+                if addOk then
+                    pendingOldEntriesReplaced = {}
+                else
+                    logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_REPLACED_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
+                end
+            else
+                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. OLD_REPLACED_COLLECTION_NAME .. "'\n")
+            end
+        end
+
+        if #pendingOldAndNewPairs > 0 then
+            flushedSomething = true
+            if not oldAndNewCollection then
+                oldAndNewCollection = findOrCreateCollection(OLD_AND_NEW_COLLECTION_NAME, logf)
+            end
+
+            if oldAndNewCollection then
+                local combinedPending = {}
+                for _, pair in ipairs(pendingOldAndNewPairs) do
+                    table.insert(combinedPending, pair.old)
+                    table.insert(combinedPending, pair.new)
+                end
+                local addOk, addErr = withCatalogWriteAccess("Add old and new entries to " .. OLD_AND_NEW_COLLECTION_NAME, function()
+                    oldAndNewCollection:addPhotos(combinedPending)
+                end)
+                if addOk then
+                    pendingOldAndNewPairs = {}
+                else
+                    logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
+                end
+            else
+                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "'\n")
+            end
+        end
+
+        if forceFlush or flushedSomething then
+            lastCollectionFlushAt = os.time()
+        end
+    end
 
     for index, line in ipairs(rows) do
         if progress:isCanceled() then
@@ -336,12 +422,16 @@ local function importPhotosFromRecoveryCsv()
                     if importedPhoto then
                         counts.imported = counts.imported + 1
                         table.insert(importedPhotos, importedPhoto)
+                        table.insert(pendingImportedPhotos, importedPhoto)
 
                         if normalizedMissingPath ~= "" then
                             local oldPhoto = catalog:findPhotoByPath(normalizedMissingPath)
                             if oldPhoto then
                                 table.insert(oldEntriesReplaced, oldPhoto)
-                                table.insert(oldAndNewPairs, { old = oldPhoto, new = importedPhoto })
+                                table.insert(pendingOldEntriesReplaced, oldPhoto)
+                                local pair = { old = oldPhoto, new = importedPhoto }
+                                table.insert(oldAndNewPairs, pair)
+                                table.insert(pendingOldAndNewPairs, pair)
                             end
                         end
                     else
@@ -352,23 +442,13 @@ local function importPhotosFromRecoveryCsv()
             end
         end
 
+        flushPendingCollections(false)
         LrTasks.yield()
     end
 
-    local collection = nil
-    if #importedPhotos > 0 then
-        collection = findOrCreateCollection(COLLECTION_NAME, logf)
-        if collection then
-            local addOk, addErr = withCatalogWriteAccess("Add imported photos to " .. COLLECTION_NAME, function()
-                collection:addPhotos(importedPhotos)
-            end)
-            if not addOk then
-                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection: " .. tostring(addErr) .. "\n")
-            end
-        else
-            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. COLLECTION_NAME .. "'\n")
-        end
+    flushPendingCollections(true)
 
+    if #importedPhotos > 0 then
         local activePhoto = importedPhotos[1]
         local selectedPhotos = {}
         for i = 2, #importedPhotos do
@@ -381,39 +461,6 @@ local function importPhotosFromRecoveryCsv()
 
         if not selectOk then
             logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<selection>\tFailed to select imported photos: " .. tostring(selectErr) .. "\n")
-        end
-    end
-
-    if #oldEntriesReplaced > 0 then
-        local oldReplacedCollection = findOrCreateCollection(OLD_REPLACED_COLLECTION_NAME, logf)
-        if oldReplacedCollection then
-            local addOk, addErr = withCatalogWriteAccess("Add old entries to " .. OLD_REPLACED_COLLECTION_NAME, function()
-                oldReplacedCollection:addPhotos(oldEntriesReplaced)
-            end)
-            if not addOk then
-                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_REPLACED_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
-            end
-        else
-            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. OLD_REPLACED_COLLECTION_NAME .. "'\n")
-        end
-    end
-
-    if #oldAndNewPairs > 0 then
-        local oldAndNewCollection = findOrCreateCollection(OLD_AND_NEW_COLLECTION_NAME, logf)
-        if oldAndNewCollection then
-            local combined = {}
-            for _, pair in ipairs(oldAndNewPairs) do
-                table.insert(combined, pair.old)
-                table.insert(combined, pair.new)
-            end
-            local addOk, addErr = withCatalogWriteAccess("Add old and new entries to " .. OLD_AND_NEW_COLLECTION_NAME, function()
-                oldAndNewCollection:addPhotos(combined)
-            end)
-            if not addOk then
-                logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
-            end
-        else
-            logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tCould not find or create collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "'\n")
         end
     end
 

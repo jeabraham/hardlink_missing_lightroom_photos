@@ -55,6 +55,10 @@ redundant catalog entries manually — especially entries that are already missi
 since there is no need to keep a catalog record pointing to a missing file when a
 same-or-better image already exists in a proper folder.
 
+The comparison collection is updated incrementally during processing (roughly every
+5 minutes, between photo boundaries), so partial results are visible before the run
+finishes.
+
 A debug log is written to `~/Desktop/check_same_or_better_debug.log`.
 
 ---
@@ -329,6 +333,7 @@ What it does:
 - Imports remaining files in place using `catalog:addPhoto()` (no move/copy/rename).
 - Does not use `triggerImportUI()` (Lightroom SDK cannot preselect arbitrary files across many folders).
 - Adds successfully imported photos to collection **`new-files-imported`** (reuses it if it already exists).
+- Updates collections incrementally during processing (roughly every 5 minutes, between row boundaries), so you can start review work earlier and keep partial results if you cancel.
 - Selects imported photos when practical.
 - Writes detailed failures (path + error) to `~/Desktop/import_recovery_csv_failures.log`.
 - Reports counts for imported / already present / missing-unreadable / failed.
