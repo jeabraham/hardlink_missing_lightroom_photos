@@ -19,6 +19,7 @@ local DEBUG_VERBOSE = true
 local DEBUG_MAX_ECHO_PHOTOS = 5
 local COLLECTION_NAME = "Has Same Or Better"
 local COMPARISON_COLLECTION_NAME = "Same Or Better Comparison"
+local COLLECTION_FLUSH_INTERVAL_SECONDS = 5 * 60
 
 local function logToFile(path, content)
     local f, err = io.open(path, "a")
@@ -161,8 +162,27 @@ local function checkForSameOrBetter()
 
     local addedCount = 0
     local skippedCount = 0
-    -- Accumulate photos for the comparison collection so we can add them in bulk
-    local comparisonPhotos = {}
+    -- Queue photos for periodic writes so users can start reviewing before completion.
+    local pendingComparisonPhotos = {}
+    local lastComparisonFlushAt = os.time()
+
+    local function flushPendingComparisonPhotos(forceFlush)
+        local now = os.time()
+        if not forceFlush and (now - lastComparisonFlushAt) < COLLECTION_FLUSH_INTERVAL_SECONDS then
+            return
+        end
+
+        local flushedSomething = false
+        if #pendingComparisonPhotos > 0 then
+            flushedSomething = true
+            addPhotosToCollection(comparisonCollection, pendingComparisonPhotos, debugPath)
+            pendingComparisonPhotos = {}
+        end
+
+        if forceFlush or flushedSomething then
+            lastComparisonFlushAt = os.time()
+        end
+    end
 
     for index, photo in ipairs(photos) do
         if progressScope:isCanceled() then
@@ -288,21 +308,22 @@ local function checkForSameOrBetter()
                 addPhotoToCollection(collection, photo, debugPath)
                 addedCount = addedCount + 1
                 -- Queue selected photo and all matched candidates for the comparison collection
-                table.insert(comparisonPhotos, photo)
+                table.insert(pendingComparisonPhotos, photo)
                 for _, candidate in ipairs(matchedCandidates) do
-                    table.insert(comparisonPhotos, candidate)
+                    table.insert(pendingComparisonPhotos, candidate)
                 end
             else
                 debugLog(debugPath, "No same-or-better found for: " .. photoLabel)
             end
         end
 
+        flushPendingComparisonPhotos(false)
         progressScope:setPortionComplete(index, totalPhotos)
         LrTasks.yield()
     end
 
-    -- Populate the comparison collection in one write operation
-    addPhotosToCollection(comparisonCollection, comparisonPhotos, debugPath)
+    -- Flush any remaining photos at completion/cancelation.
+    flushPendingComparisonPhotos(true)
 
     progressScope:done()
     debugLog(debugPath, "Finished. addedCount=" .. tostring(addedCount) .. ", skippedCount=" .. tostring(skippedCount))
