@@ -395,6 +395,7 @@ FindLinkMatches.lrplugin/   Lightroom plugin — catalog-based tools for missing
   write_csv.lua             Step 1/2 input export: Writes all selected photos to Missing_Photos.csv with metadata
   write_missing_csv.lua     Same as write_csv.lua but attempts to skip non-missing photos, not tested yet.
   import_recovery_csv.lua   Workflow 2: import `new_file` rows directly in place into catalog + collection
+  LIGHTROOM_LUA_DESIGN_NOTES.md  Notes on Lightroom Lua SDK design choices, pcall usage, and missing-photo reliability findings
 
 recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine
 relink_missing_photos.py    Phase 2: index filesystem + match by EXIF metadata
