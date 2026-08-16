@@ -13,12 +13,52 @@ See [DESIGN.md](DESIGN.md) for the full rationale, background, and planned futur
 ## Recovery workflow
 
 ```
-0. Pre-process: identify and remove redundant catalog entries  ← Check For Same or Better (Lightroom plugin)
-1. Export missing-photo paths from Lightroom (see below)
-2. Recover originals from Time Machine           ← recover_from_timemachine.py
-3. Re-run Lightroom "Find All Missing Photos"
-4. Find identical copies elsewhere and hardlink  ← relink_missing_photos.py
-5. Handle remaining gaps manually
+0.  Pre-process: identify and remove redundant catalog entries
+      ← Check For Same or Better (Lightroom plugin)
+
+1.  Export missing-photo paths from Lightroom
+      ← Write CSV File for Photos (Lightroom plugin)
+
+2.  Run the Python matching script on the missing-photos CSV
+      ← relink_missing_photos.py  (use --mdfind on first pass)
+
+3.  Review the output files carefully
+      (relink_good_matches.sh, higher_resolution.sh,
+       resolution_mismatch.sh, import_other_formats.csv,
+       import_same_format_higher_resolution.csv, Still_Missing_Photos.csv)
+
+4.  Apply hardlinks for good matches and higher-resolution matches
+      ← bash relink_good_matches.sh
+      ← bash higher_resolution.sh
+
+5.  Re-export a fresh missing-photos CSV from Lightroom
+
+6.  Re-run the Python matching script (optionally with --search-root this time)
+      ← relink_missing_photos.py
+
+7.  Apply hardlinks for good matches and higher-resolution matches again
+      ← bash relink_good_matches.sh
+      ← bash higher_resolution.sh
+
+    Repeat steps 5–7 (and optionally 0 between passes) as needed
+    to further prune the still-missing set.
+
+8.  Assemble final import lists from the CSV outputs of all runs
+      (import_other_formats.csv, import_same_format_higher_resolution.csv)
+
+9.  Import new images into the catalog using one or both workflows:
+      Workflow 1: gather files into an import directory, then use the
+                  Lightroom Import dialog
+                  ← gather_import_files.py
+      Workflow 2: import files directly in place
+                  ← Import photos from recovery CSV (Lightroom plugin)
+
+10. Use Check For Same or Better again to identify duplicates introduced
+    by the imports, copy develop settings between them, and delete
+    the redundant catalog entries.
+      ← Check For Same or Better (Lightroom plugin)
+
+11. (Optional) Link duplicate files on disk with rdfind to reclaim disk space.
 ```
 
 ---
@@ -86,7 +126,7 @@ Save the file as `data/Missing_Photos.csv` (or pass a custom path to the scripts
 
 ---
 
-## Phase 1 — Recover originals from Time Machine
+## Step 1b — (Optional) Recover originals from Time Machine
 
 **Script:** `recover_from_timemachine.py`  
 **Status:** Implemented and tested against APFS snapshots from Time Machine and from Carbon Copy Cloner
@@ -194,17 +234,16 @@ a restored copy or another candidate.
 
 ---
 
-## Phase 2 — Find identical copies and hardlink them
-
-After recovering everything possible from Time Machine, re-run
-**Library → Find All Missing Photos** in Lightroom, then export a fresh CSV
-using **Write CSV File for Photos**.
-
-### Step 2a — Find candidates with Python
+## Step 2 — Run the Python matching script
 
 **Script:** `relink_missing_photos.py`  
 **Status:** Implemented; tested in various scenarios, yet the restore functions (shell commands) have not yet been tested fully within Lightroom.  
 **Dependencies:** Python 3.9+, `pandas`, `python-dateutil`, `exiftool` (CLI tool).
+
+On the first pass, `--mdfind` (macOS Spotlight) is a convenient choice because it
+does not require knowing or specifying a search root in advance.  On subsequent
+passes you can switch to `--search-root` to constrain the search to a specific
+volume or directory tree.
 
 ```bash
 # Install Python dependencies:
@@ -272,7 +311,66 @@ The summary counts each input photo exactly once in its primary outcome category
 `Still missing`).  Alternate candidates and comment lines are counted separately so
 the total primary outcomes always equals the number of photos processed.
 
-### Step 2d — Choose how to process recommendation CSV rows
+---
+
+## Step 3 — Review the output files carefully
+
+Before applying any hardlinks, read through all output files produced by
+`relink_missing_photos.py`:
+
+- **`relink_good_matches.sh`** — exact-resolution matches; generally safe to apply.
+- **`higher_resolution.sh`** — candidate is higher resolution than Lightroom's
+  record (subset of `resolution_mismatch.sh`); also generally safe to apply.
+- **`resolution_mismatch.sh`** — resolution differs; review before applying.
+  Each entry shows the `LR:WxH` resolution Lightroom knows about.
+- **`import_other_formats.csv`** — cross-format candidates; set aside for later
+  import (Step 8–9).
+- **`import_same_format_higher_resolution.csv`** — same-format candidates at a
+  higher resolution than what was relinked; also set aside for Step 8–9.
+- **`Still_Missing_Photos.csv`** — photos with no match yet.
+
+---
+
+## Step 4 — Apply hardlinks for good matches and higher-resolution matches
+
+Review `relink_good_matches.sh` and `higher_resolution.sh`, then run them:
+
+```bash
+bash relink_good_matches.sh
+bash higher_resolution.sh
+```
+
+This creates hardlinks at the exact pathnames Lightroom already expects, without
+consuming additional disk space and without modifying the Lightroom catalog.
+
+---
+
+## Steps 5–7 — Iterate: re-export, re-run, re-apply
+
+After applying hardlinks, Lightroom will find some photos; others may still be
+missing.  Iterate to recover more:
+
+1. In Lightroom, re-run **Library → Find All Missing Photos**, then re-export a
+   fresh CSV using **Write CSV File for Photos**.
+2. Re-run `relink_missing_photos.py` on the new CSV.  On this pass you may want
+   to use `--search-root` instead of `--mdfind` to narrow the search scope.
+3. Apply hardlinks again from the new `relink_good_matches.sh` and
+   `higher_resolution.sh`.
+
+Repeat as many times as needed.  Between iterations you can also re-run
+**Check For Same or Better** (Step 0) to further prune the missing set,
+especially for photos that remain missing despite multiple relinking passes.
+
+---
+
+## Steps 8–9 — Import remaining candidates into the catalog
+
+### Step 8 — Assemble import lists from all runs
+
+Collect `import_other_formats.csv` and `import_same_format_higher_resolution.csv`
+from each run of `relink_missing_photos.py`.
+
+### Step 9 — Choose how to process recommendation CSV rows
 
 `import_other_formats.csv` and `import_same_format_higher_resolution.csv` are
 recommendation lists, not single all-or-nothing batches. You can inspect/edit them
@@ -353,7 +451,7 @@ already written to the output files.
 > useful for other users, but **it does not work reliably yet**.  The Python script
 > (`relink_missing_photos.py`) is the currently recommended path.
 
-### Step 2e — Compare metadata for a specific file
+### Utility: Compare metadata for a specific file
 
 ```bash
 python3 compare_metadata.py data/Missing_Photos.csv <expected_filename> <candidate_path>
@@ -363,16 +461,29 @@ Loads metadata from the CSV for `<expected_filename>` and compares it against
 `<candidate_path>` using exiftool.  Useful for manually verifying a specific
 candidate before linking.
 
-### Step 2f — Apply the hardlinks
+---
 
-Review `relink_good_matches.sh`, then run it:
+## Step 10 — Use Check For Same or Better to identify and clean up duplicates
 
-```bash
-bash relink_good_matches.sh
-```
+After importing new images (Step 9), you may have duplicates in the catalog — for
+example, the original smart-preview entry and the newly imported higher-resolution
+copy of the same photo.  Re-run **Check For Same or Better** (same plugin described
+in Step 0) to surface those pairs:
 
-This creates hardlinks at Lightroom's expected pathnames without consuming
-additional disk space and without modifying the Lightroom catalog.
+1. Select all photos in the folders or collections that may contain duplicates.
+2. Run **Library → Plug-in Extras → Check For Same or Better**.
+3. Review the **"Has Same Or Better"** and **"Same Or Better Comparisons"**
+   collections.
+4. Copy develop settings from the old entry to the new one where needed, then
+   delete the redundant catalog entry.
+
+---
+
+## Step 11 — (Optional) Link duplicates on disk with rdfind
+
+If you have duplicate files on disk and want to reclaim disk space, consider using
+[rdfind](https://rdfind.pauldreik.se/) to replace duplicate file content with
+hardlinks.  This is purely optional and has no effect on the Lightroom catalog.
 
 ---
 
@@ -397,15 +508,15 @@ FindLinkMatches.lrplugin/   Lightroom plugin — catalog-based tools for missing
   Info.lua                  Plugin metadata
   main.lua                  WIP: find catalog matches + link command suggestions (not yet working)
   check_same_or_better.lua  Step 0: add photos that have a same-or-better copy to a collection
-  write_csv.lua             Step 1/2 input export: Writes all selected photos to Missing_Photos.csv with metadata
+  write_csv.lua             Step 1 input export: Writes all selected photos to Missing_Photos.csv with metadata
   write_missing_csv.lua     Same as write_csv.lua but attempts to skip non-missing photos, not tested yet.
-  import_recovery_csv.lua   Workflow 2: import `new_file` rows directly in place into catalog + collection
+  import_recovery_csv.lua   Step 9 Workflow 2: import `new_file` rows directly in place into catalog + collection
   LIGHTROOM_LUA_DESIGN_NOTES.md  Notes on Lightroom Lua SDK design choices, pcall usage, and missing-photo reliability findings
 
-recover_from_timemachine.py Phase 1: inspect/scan/restore from Time Machine
-relink_missing_photos.py    Phase 2: index filesystem + match by EXIF metadata
+recover_from_timemachine.py Step 1b: inspect/scan/restore from Time Machine
+relink_missing_photos.py    Steps 2/6: index filesystem + match by EXIF metadata
 compare_metadata.py         Manual metadata comparison helper
-gather_import_files.py      Workflow 1: gather `new_file` rows into an import directory via hardlink/copy
+gather_import_files.py      Step 9 Workflow 1: gather `new_file` rows into an import directory via hardlink/copy
 
 data/
   Missing_Photos.csv        Input: exported from Lightroom via plugin CSV command
