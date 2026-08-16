@@ -151,6 +151,31 @@ local function findExistingCollection(name)
     return nil
 end
 
+local function withCatalogWriteAccess(actionName, func, timeoutSeconds)
+    local ok, err
+
+    if catalog.hasWriteAccess then
+        ok, err = pcall(func)
+    else
+        local status = nil
+        ok, err = pcall(function()
+            status = catalog:withWriteAccessDo(actionName, func, {
+                timeout = timeoutSeconds or 30,
+            })
+        end)
+
+        if ok and status == "aborted" then
+            return false, "timed out waiting for catalog write access"
+        end
+    end
+
+    if not ok then
+        return false, err
+    end
+
+    return true, nil
+end
+
 local function findOrCreateCollection(name, logf)
     local existingCollection = findExistingCollection(name)
     if existingCollection then
@@ -158,10 +183,8 @@ local function findOrCreateCollection(name, logf)
     end
 
     local createdCollection
-    local ok, err = pcall(function()
-        catalog:withWriteAccessDo("Create collection " .. name, function()
-            createdCollection = catalog:createCollection(name, nil, true)
-        end)
+    local ok, err = withCatalogWriteAccess("Create collection " .. name, function()
+        createdCollection = catalog:createCollection(name, nil, true)
     end)
 
     if not ok then
@@ -291,21 +314,19 @@ local function importPhotosFromRecoveryCsv()
                     local importedPhoto = nil
                     local importErr = nil
 
-                    local ok, writeErr = pcall(function()
-                        catalog:withWriteAccessDo("Import photo from recovery CSV", function()
-                            local okAdd, resultOrErr = pcall(function()
-                                return catalog:addPhoto(normalizedPath)
-                            end)
-
-                            if okAdd then
-                                importedPhoto = resultOrErr
-                                if not importedPhoto then
-                                    importErr = "catalog:addPhoto returned nil"
-                                end
-                            else
-                                importErr = resultOrErr
-                            end
+                    local ok, writeErr = withCatalogWriteAccess("Import photo from recovery CSV", function()
+                        local okAdd, resultOrErr = pcall(function()
+                            return catalog:addPhoto(normalizedPath)
                         end)
+
+                        if okAdd then
+                            importedPhoto = resultOrErr
+                            if not importedPhoto then
+                                importErr = "catalog:addPhoto returned nil"
+                            end
+                        else
+                            importErr = resultOrErr
+                        end
                     end)
 
                     if not ok then
@@ -338,10 +359,8 @@ local function importPhotosFromRecoveryCsv()
     if #importedPhotos > 0 then
         collection = findOrCreateCollection(COLLECTION_NAME, logf)
         if collection then
-            local addOk, addErr = pcall(function()
-                catalog:withWriteAccessDo("Add imported photos to " .. COLLECTION_NAME, function()
-                    collection:addPhotos(importedPhotos)
-                end)
+            local addOk, addErr = withCatalogWriteAccess("Add imported photos to " .. COLLECTION_NAME, function()
+                collection:addPhotos(importedPhotos)
             end)
             if not addOk then
                 logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection: " .. tostring(addErr) .. "\n")
@@ -368,10 +387,8 @@ local function importPhotosFromRecoveryCsv()
     if #oldEntriesReplaced > 0 then
         local oldReplacedCollection = findOrCreateCollection(OLD_REPLACED_COLLECTION_NAME, logf)
         if oldReplacedCollection then
-            local addOk, addErr = pcall(function()
-                catalog:withWriteAccessDo("Add old entries to " .. OLD_REPLACED_COLLECTION_NAME, function()
-                    oldReplacedCollection:addPhotos(oldEntriesReplaced)
-                end)
+            local addOk, addErr = withCatalogWriteAccess("Add old entries to " .. OLD_REPLACED_COLLECTION_NAME, function()
+                oldReplacedCollection:addPhotos(oldEntriesReplaced)
             end)
             if not addOk then
                 logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_REPLACED_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
@@ -389,10 +406,8 @@ local function importPhotosFromRecoveryCsv()
                 table.insert(combined, pair.old)
                 table.insert(combined, pair.new)
             end
-            local addOk, addErr = pcall(function()
-                catalog:withWriteAccessDo("Add old and new entries to " .. OLD_AND_NEW_COLLECTION_NAME, function()
-                    oldAndNewCollection:addPhotos(combined)
-                end)
+            local addOk, addErr = withCatalogWriteAccess("Add old and new entries to " .. OLD_AND_NEW_COLLECTION_NAME, function()
+                oldAndNewCollection:addPhotos(combined)
             end)
             if not addOk then
                 logf:write(os.date("%Y-%m-%d %H:%M:%S") .. "\t<collection>\tFailed to add photos to collection '" .. OLD_AND_NEW_COLLECTION_NAME .. "': " .. tostring(addErr) .. "\n")
