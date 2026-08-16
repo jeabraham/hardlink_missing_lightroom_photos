@@ -155,10 +155,10 @@ local function withCatalogWriteAccess(actionName, func, timeoutSeconds)
     local ok, err
 
     if catalog.hasWriteAccess then
-        ok, err = pcall(func)
+        ok, err = LrTasks.pcall(func)
     else
         local status = nil
-        ok, err = pcall(function()
+        ok, err = LrTasks.pcall(function()
             status = catalog:withWriteAccessDo(actionName, func, {
                 timeout = timeoutSeconds or 30,
             })
