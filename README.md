@@ -48,7 +48,9 @@ The plugin searches the active catalog for non-missing photos whose:
 - resolution is the same or higher.
 
 Photos that meet these criteria are added to a special collection called
-**"Has Same Or Better"**.  You can then review that collection and delete the
+**"Has Same Or Better"** and both those and their matches are added to a collection
+called **"Same Or Better Comparisons"**. You can then review those collections and
+copy develop settings, investigate other metadata, and then delete the
 redundant catalog entries manually — especially entries that are already missing,
 since there is no need to keep a catalog record pointing to a missing file when a
 same-or-better image already exists in a proper folder.
@@ -59,7 +61,8 @@ A debug log is written to `~/Desktop/check_same_or_better_debug.log`.
 
 ## Step 1 — Export missing-photo paths from Lightroom
 
-Use Lightroom Classic's built-in **"Find All Missing Photos"** (Library menu) to
+Use Lightroom Classic's built-in **"Find All Missing Photos"** (Library menu) 
+or the excellent [AnyFilter plugin](https://johnrellis.com/lightroom/anyfilter.htm) to
 populate the `Missing Photographs` smart collection.
 
 Then export the list using this repository's Lightroom plugin:
