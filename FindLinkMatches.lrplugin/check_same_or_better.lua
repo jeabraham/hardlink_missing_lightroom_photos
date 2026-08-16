@@ -18,6 +18,7 @@ local TIME_DELTA = 5 * 60 -- 5 minutes in seconds
 local DEBUG_VERBOSE = true
 local DEBUG_MAX_ECHO_PHOTOS = 5
 local COLLECTION_NAME = "Has Same Or Better"
+local COMPARISON_COLLECTION_NAME = "Same Or Better Comparison"
 
 local function logToFile(path, content)
     local f, err = io.open(path, "a")
@@ -83,13 +84,13 @@ local function isSameOrBetterResolution(selWidth, selHeight, candWidth, candHeig
     return result
 end
 
-local function findOrCreateCollection(debugPath)
+local function findOrCreateCollection(name, debugPath)
     -- Look for existing collection
     local allCollections = catalog:getChildCollections()
     if allCollections then
         for _, col in ipairs(allCollections) do
-            if col:getName() == COLLECTION_NAME then
-                debugLog(debugPath, "Found existing collection: " .. COLLECTION_NAME)
+            if col:getName() == name then
+                debugLog(debugPath, "Found existing collection: " .. name)
                 return col
             end
         end
@@ -97,18 +98,26 @@ local function findOrCreateCollection(debugPath)
 
     -- Create it
     local newCollection
-    catalog:withWriteAccessDo("Create collection " .. COLLECTION_NAME, function()
-        newCollection = catalog:createCollection(COLLECTION_NAME, nil, true)
+    catalog:withWriteAccessDo("Create collection " .. name, function()
+        newCollection = catalog:createCollection(name, nil, true)
     end)
-    debugLog(debugPath, "Created collection: " .. COLLECTION_NAME)
+    debugLog(debugPath, "Created collection: " .. name)
     return newCollection
 end
 
 local function addPhotoToCollection(collection, photo, debugPath)
-    catalog:withWriteAccessDo("Add photo to " .. COLLECTION_NAME, function()
+    catalog:withWriteAccessDo("Add photo to " .. collection:getName(), function()
         collection:addPhotos({ photo })
     end)
-    debugLog(debugPath, "Added photo to collection: " .. COLLECTION_NAME)
+    debugLog(debugPath, "Added photo to collection: " .. collection:getName())
+end
+
+local function addPhotosToCollection(collection, photoList, debugPath)
+    if #photoList == 0 then return end
+    catalog:withWriteAccessDo("Add photos to " .. collection:getName(), function()
+        collection:addPhotos(photoList)
+    end)
+    debugLog(debugPath, "Added " .. tostring(#photoList) .. " photo(s) to collection: " .. collection:getName())
 end
 
 local function checkForSameOrBetter()
@@ -136,15 +145,24 @@ local function checkForSameOrBetter()
         return
     end
 
-    local collection = findOrCreateCollection(debugPath)
+    local collection = findOrCreateCollection(COLLECTION_NAME, debugPath)
     if not collection then
         progressScope:done()
         LrDialogs.message("Error", "Could not find or create the '" .. COLLECTION_NAME .. "' collection.")
         return
     end
 
+    local comparisonCollection = findOrCreateCollection(COMPARISON_COLLECTION_NAME, debugPath)
+    if not comparisonCollection then
+        progressScope:done()
+        LrDialogs.message("Error", "Could not find or create the '" .. COMPARISON_COLLECTION_NAME .. "' collection.")
+        return
+    end
+
     local addedCount = 0
     local skippedCount = 0
+    -- Accumulate photos for the comparison collection so we can add them in bulk
+    local comparisonPhotos = {}
 
     for index, photo in ipairs(photos) do
         if progressScope:isCanceled() then
@@ -210,6 +228,7 @@ local function checkForSameOrBetter()
             skippedCount = skippedCount + 1
         else
             local foundSameOrBetter = false
+            local matchedCandidates = {}
 
             setDebugCaption(progressScope, totalPhotos, "Comparing " .. tostring(#candidates) .. " candidates for: " .. fileName)
 
@@ -257,7 +276,7 @@ local function checkForSameOrBetter()
                     if sameCamera and timeMatch and resolutionOk then
                         debugLog(debugPath, "Found same or better: " .. candidateLabel)
                         foundSameOrBetter = true
-                        break
+                        table.insert(matchedCandidates, candidate)
                     end
                 end
 
@@ -268,6 +287,11 @@ local function checkForSameOrBetter()
                 debugLog(debugPath, "Adding selected photo to collection: " .. photoLabel)
                 addPhotoToCollection(collection, photo, debugPath)
                 addedCount = addedCount + 1
+                -- Queue selected photo and all matched candidates for the comparison collection
+                table.insert(comparisonPhotos, photo)
+                for _, candidate in ipairs(matchedCandidates) do
+                    table.insert(comparisonPhotos, candidate)
+                end
             else
                 debugLog(debugPath, "No same-or-better found for: " .. photoLabel)
             end
@@ -277,6 +301,9 @@ local function checkForSameOrBetter()
         LrTasks.yield()
     end
 
+    -- Populate the comparison collection in one write operation
+    addPhotosToCollection(comparisonCollection, comparisonPhotos, debugPath)
+
     progressScope:done()
     debugLog(debugPath, "Finished. addedCount=" .. tostring(addedCount) .. ", skippedCount=" .. tostring(skippedCount))
 
@@ -284,13 +311,17 @@ local function checkForSameOrBetter()
         LrDialogs.message(
             "Check canceled.",
             "Partial results added to the '" .. COLLECTION_NAME .. "' collection.\n"
-                .. "Added: " .. tostring(addedCount) .. " photos."
+                .. "Added: " .. tostring(addedCount) .. " photos.\n\n"
+                .. "The '" .. COMPARISON_COLLECTION_NAME .. "' collection contains those same photos plus their same-or-better matches.\n"
+                .. "Sort '" .. COMPARISON_COLLECTION_NAME .. "' by filename to compare photos side-by-side."
         )
     else
         LrDialogs.message(
             "Check complete.",
             "Added " .. tostring(addedCount) .. " photo(s) to the '" .. COLLECTION_NAME .. "' collection.\n"
                 .. "These photos have a same-or-better version elsewhere in the catalog.\n\n"
+                .. "The '" .. COMPARISON_COLLECTION_NAME .. "' collection contains those same photos plus their same-or-better matches.\n"
+                .. "Sort '" .. COMPARISON_COLLECTION_NAME .. "' by filename to compare photos side-by-side, copy develop settings, or decide which to delete.\n\n"
                 .. "Debug log: " .. debugPath
         )
     end
