@@ -315,7 +315,7 @@ local function importPhotosFromRecoveryCsv()
                     local importErr = nil
 
                     local ok, writeErr = withCatalogWriteAccess("Import photo from recovery CSV", function()
-                        local okAdd, resultOrErr = pcall(function()
+                        local okAdd, resultOrErr = LrTasks.pcall(function()
                             return catalog:addPhoto(normalizedPath)
                         end)
 
@@ -375,7 +375,7 @@ local function importPhotosFromRecoveryCsv()
             table.insert(selectedPhotos, importedPhotos[i])
         end
 
-        local selectOk, selectErr = pcall(function()
+        local selectOk, selectErr = LrTasks.pcall(function()
             catalog:setSelectedPhotos(activePhoto, selectedPhotos)
         end)
 
