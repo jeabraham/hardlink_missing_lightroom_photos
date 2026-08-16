@@ -15,6 +15,9 @@ local COLLECTION_NAME = "new-files-imported"
 local OLD_REPLACED_COLLECTION_NAME = "old-entries-replaced"
 local OLD_AND_NEW_COLLECTION_NAME = "old-and-new-entries"
 local COLLECTION_FLUSH_INTERVAL_SECONDS = 5 * 60
+local WRITE_ACCESS_TIMEOUT_SECONDS = 30
+local WRITE_ACCESS_MAX_ATTEMPTS = 6
+local WRITE_ACCESS_RETRY_SLEEP_SECONDS = 1
 
 local function trim(s)
     return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
@@ -153,28 +156,39 @@ local function findExistingCollection(name)
 end
 
 local function withCatalogWriteAccess(actionName, func, timeoutSeconds)
-    local ok, err
+    local timeout = timeoutSeconds or WRITE_ACCESS_TIMEOUT_SECONDS
+    local maxAttempts = WRITE_ACCESS_MAX_ATTEMPTS
 
-    if catalog.hasWriteAccess then
-        ok, err = LrTasks.pcall(func)
-    else
+    for attempt = 1, maxAttempts do
+        local ok, err
         local status = nil
-        ok, err = LrTasks.pcall(function()
-            status = catalog:withWriteAccessDo(actionName, func, {
-                timeout = timeoutSeconds or 30,
-            })
-        end)
 
-        if ok and status == "aborted" then
-            return false, "timed out waiting for catalog write access"
+        if catalog.hasWriteAccess then
+            ok, err = LrTasks.pcall(func)
+        else
+            ok, err = LrTasks.pcall(function()
+                status = catalog:withWriteAccessDo(actionName, func, {
+                    timeout = timeout,
+                })
+            end)
+        end
+
+        if not ok then
+            return false, err
+        end
+
+        if status ~= "aborted" then
+            return true, nil
+        end
+
+        if attempt < maxAttempts then
+            LrTasks.sleep(WRITE_ACCESS_RETRY_SLEEP_SECONDS)
+        else
+            return false, "timed out waiting for catalog write access after " .. tostring(maxAttempts) .. " attempts"
         end
     end
 
-    if not ok then
-        return false, err
-    end
-
-    return true, nil
+    return false, "timed out waiting for catalog write access"
 end
 
 local function findOrCreateCollection(name, logf)
