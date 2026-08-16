@@ -146,8 +146,8 @@ def make_link_or_copy_command(candidate_path, original_path, copy_across_volumes
         src_vol = get_volume(candidate_path)
         dst_vol = get_volume(original_path)
         if src_vol != dst_vol:
-            return f'cp "{candidate_path}" "{original_path}"'
-    return f'ln "{candidate_path}" "{original_path}"'
+            return f'cp {shlex.quote(str(candidate_path))} {shlex.quote(str(original_path))}'
+    return f'ln {shlex.quote(str(candidate_path))} {shlex.quote(str(original_path))}'
 
 def is_raw_file(path):
     return Path(path).suffix.lower() in RAW_EXTENSIONS
