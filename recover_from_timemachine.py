@@ -22,6 +22,9 @@ Examples:
   python3 recover_from_timemachine.py scan data/Missing_Photos.csv /Volumes/Catbus --source-volume /Volumes/Photos
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --dry-run
   python3 recover_from_timemachine.py restore --report data/timemachine_recovery_candidates.csv --source-volume /Volumes/Ladyhawke --execute
+
+Note: "Ladyhawke" in examples is just a sample source-volume name; replace it
+with your own volume name.
 """
 
 import argparse
@@ -329,7 +332,8 @@ def load_missing_photos(csv_path: Path) -> list:
 
 def relative_volume_path(expected_path: str, source_volume: str) -> str | None:
     """
-    Given a full expected path such as /Volumes/Ladyhawke/RawPhotos/foo/bar.NEF,
+    Given a full expected path such as /Volumes/Ladyhawke/RawPhotos/foo/bar.NEF
+    (replace Ladyhawke with your own volume name),
     return the relative portion (RawPhotos/foo/bar.NEF).
     Returns None if the path is not under the source volume (e.g. /Volumes/Ladyhawke).
     """
@@ -341,8 +345,9 @@ def relative_volume_path(expected_path: str, source_volume: str) -> str | None:
 
 def normalize_source_volume(source_volume: str | None) -> str | None:
     """
-    Normalize ``--source-volume`` so ``Ladyhawke`` and ``/Volumes/Ladyhawke``
-    refer to the same source volume.
+    Normalize ``--source-volume`` so a bare volume name and ``/Volumes/<name>``
+    refer to the same source volume (e.g. ``Ladyhawke`` and
+    ``/Volumes/Ladyhawke``).
     """
     if not source_volume:
         return None
@@ -535,7 +540,8 @@ def is_apfs_backup_path(backup_path: str) -> bool:
 
 def _find_source_volume_in_snapshot(mountpoint: Path, volume_name: str) -> Path | None:
     """
-    Locate the source volume directory (e.g. ``Ladyhawke``) inside a mounted APFS snapshot.
+    Locate the source volume directory (e.g. ``Ladyhawke``; replace with your
+    own volume name) inside a mounted APFS snapshot.
 
     Two layouts are supported:
 
@@ -775,7 +781,8 @@ def cmd_inspect(args):
     else:
         print(
             "\nNote: pass --source-volume to check for a specific volume directory "
-            "in each snapshot (e.g. --source-volume /Volumes/Ladyhawke).",
+            "in each snapshot (e.g. --source-volume /Volumes/Ladyhawke; replace "
+            "Ladyhawke with your own volume name).",
             file=sys.stderr,
         )
 
@@ -1403,7 +1410,8 @@ def build_parser():
         default=None,
         help=(
             "Source volume whose backups you want to check, as either a volume name "
-            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke).  "
+            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke; replace "
+            "Ladyhawke with your own volume name).  "
             "When provided, each snapshot is checked for the presence of that volume directory."
         ),
     )
@@ -1425,7 +1433,8 @@ def build_parser():
         required=True,
         help=(
             "Source volume that was backed up, as either a volume name "
-            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke).  "
+            "or full path (e.g. Ladyhawke or /Volumes/Ladyhawke; replace "
+            "Ladyhawke with your own volume name).  "
             "Used to strip the volume prefix and locate the backup directory inside snapshots."
         ),
     )
@@ -1477,7 +1486,8 @@ def build_parser():
         default=None,
         help=(
             "Original source volume, as either a volume name or full path "
-            "(e.g. Ladyhawke or /Volumes/Ladyhawke).  "
+            "(e.g. Ladyhawke or /Volumes/Ladyhawke; replace Ladyhawke with your "
+            "own volume name).  "
             "If omitted, inferred from the expected_path column in the report CSV."
         ),
     )
