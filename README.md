@@ -23,7 +23,7 @@ See [DESIGN.md](DESIGN.md) for the full rationale, background, and planned futur
       ← recover_from_timemachine.py
 
 3.  Run the Python matching script on the missing-photos CSV
-      ← relink_missing_photos.py  (use --mdfind on first pass)
+      ← relink_missing_photos.py  (MacOS: use --mdfind on first pass)
 
 4.  Review the output files carefully
       (relink_good_matches.sh, higher_resolution.sh,
@@ -69,7 +69,7 @@ See [DESIGN.md](DESIGN.md) for the full rationale, background, and planned futur
 ## Step 0 — Pre-processing: identify and remove redundant catalog entries
 
 Before starting the main recovery workflow you may want to clean up catalog entries
-that are no longer needed.  A common situation: you previously exported a folder of
+that are no longer needed.  Example situation: you previously exported a folder of
 **smart previews** (lower-resolution safety copies) called, for example,
 `downloaded-smart-previews`.  Many of those entries may now be redundant because:
 
@@ -125,7 +125,7 @@ Then export the list using this repository's Lightroom plugin:
    - `Height`
    - `Camera Make`
 
-Save the file as `data/Missing_Photos.csv` (or pass a custom path to the scripts).
+Move or copy the file to `data/Missing_Photos.csv` (or anywhere you want, you can pass a custom path to the scripts).
 
 ---
 
@@ -240,7 +240,7 @@ a restored copy or another candidate.
 ## Step 3 — Run the Python matching script
 
 **Script:** `relink_missing_photos.py`  
-**Status:** Implemented; tested in various scenarios, yet the restore functions (shell commands) have not yet been tested fully within Lightroom.  
+**Status:** Implemented; tested in various scenarios, restore functions (shell commands) have been tested within Lightroom and seem to work as desired.  
 **Dependencies:** Python 3.9+, `pandas`, `python-dateutil`, `exiftool` (CLI tool).
 
 On the first pass, `--mdfind` (macOS Spotlight) is a convenient choice because it
@@ -251,6 +251,9 @@ volume or directory tree.
 ```bash
 # Install Python dependencies:
 source setup.env   # or: pip install pandas python-dateutil
+
+# Check to be sure exiftool is installed
+exiftool ver 
 
 # Walk a directory tree to find candidates (--search-root required in this mode):
 python3 relink_missing_photos.py data/Missing_Photos.csv \
@@ -264,9 +267,8 @@ Matches each missing photo against candidates using `exiftool`-extracted EXIF da
 (timestamp, camera make, width, height).  Ignores `.xmp` sidecars and requires
 extension/type matching (case-insensitive) before generating hardlink commands.
 
-Unlike the plugin, this step is not limited to what Lightroom currently returns
-from catalog search and emits separate outputs for exact relinks, resolution
-mismatches, and still-missing records.
+This step is not limited to what Lightroom currently knows
+from catalog search.  
 
 #### Candidate discovery modes
 
@@ -306,13 +308,20 @@ mismatches, and still-missing records.
 | `resolution_mismatch.sh` | Best-guess links where resolution differs (same file extension/type only). Each entry shows the Lightroom-known resolution as `LR:WxH` in the comment — note that Lightroom sometimes only knows the Smart Preview resolution, so the matched file on disk may have a *higher* resolution than what Lightroom reports, which is normal and desirable. Comment lines include alternate candidates prefixed `# Alt:`. Entries where the candidate dimensions exceed the `LR:` dimensions are tagged with `HIGHER_RESOLUTION` in the comment. |
 | `higher_resolution.sh` | Automatically extracted subset of `resolution_mismatch.sh` containing only entries where the matched file is higher resolution than Lightroom's record (tagged `HIGHER_RESOLUTION`). These are particularly safe to apply — the matched file likely has more detail than the Smart Preview Lightroom knows about. This file is generated automatically; you can also regenerate it manually with `grep -A 1 'HIGHER_RESOLUTION' resolution_mismatch.sh > higher_resolution.sh`. |
 | `import_other_formats.csv` | Ranked cross-format candidates for future import/relink handling (only when no same-extension candidate was found) |
-| `import_same_format_higher_resolution.csv` | Same-extension candidates whose resolution *exceeds* the matched file that was linked in `relink_good_matches.sh`. This happens when Lightroom only knows the Smart Preview resolution and the relinked file was matched by resolution — but there is another copy of the same format at a higher (likely original) resolution. Columns: `missing_file`, `matched_file`, `new_file`, `lr_width`, `lr_height`, `matched_width`, `matched_height`, `new_width`, `new_height`, `rank`. |
+| `import_same_format_higher_resolution.csv` | Same-extension candidates whose resolution *exceeds* the matched file that was linked in `relink_good_matches.sh`. This can happen when Lightroom only knows the Smart Preview resolution and the relinked file was matched by resolution — but there is another copy of the same format at a higher (likely original) resolution. Columns: `missing_file`, `matched_file`, `new_file`, `lr_width`, `lr_height`, `matched_width`, `matched_height`, `new_width`, `new_height`, `rank`. |
 | `Still_Missing_Photos.csv` | Records with no match found |
 
 The summary counts each input photo exactly once in its primary outcome category
 (`Relink commands (best)`, `Resolution mismatches (match)`, `Import other formats`, or
 `Still missing`).  Alternate candidates and comment lines are counted separately so
 the total primary outcomes always equals the number of photos processed.
+
+#### Interrupt and resume
+
+If the `relink_missing_photos.py` script is interrupted with Ctrl-C it flushes all output files and prints a
+ready-to-paste resume command using `--skip-rows`, `--rows-to-process`, and
+`--append-outputs`, so you can pick up where it left off without reprocessing rows
+already written to the output files.
 
 ---
 
@@ -439,21 +448,6 @@ What it does:
 - Writes detailed failures (path + error) to `~/Desktop/import_recovery_csv_failures.log`.
 - Reports counts for imported / already present / missing-unreadable / failed.
 
-#### Interrupt and resume
-
-If the script is interrupted with Ctrl-C it flushes all output files and prints a
-ready-to-paste resume command using `--skip-rows`, `--rows-to-process`, and
-`--append-outputs`, so you can pick up where it left off without reprocessing rows
-already written to the output files.
-
-> **Note — pure Lua alternative (work in progress):** There is an experimental
-> `FindLinkMatches.lrplugin` function called **Find Matches to Missing Photos**
-> (`main.lua`) that attempts to perform a similar search entirely inside Lightroom,
-> without needing a CSV or `exiftool`.  It queries the active catalog directly and
-> writes `ln` shell commands to the Desktop.  This approach is simpler and could be
-> useful for other users, but **it does not work reliably yet**.  The Python script
-> (`relink_missing_photos.py`) is the currently recommended path.
-
 ### Utility: Compare metadata for a specific file
 
 ```bash
@@ -487,6 +481,16 @@ in Step 0) to surface those pairs:
 If you have duplicate files on disk and want to reclaim disk space, consider using
 [rdfind](https://rdfind.pauldreik.se/) to replace duplicate file content with
 hardlinks.  This is purely optional and has no effect on the Lightroom catalog.
+
+
+> **Note — pure Lua alternative (work in progress):** There is an experimental
+> `FindLinkMatches.lrplugin` function called **Find Matches to Missing Photos**
+> (`main.lua`) that attempts to perform a similar search to relink_missing_photos.py entirely inside Lightroom,
+> without needing a CSV or `exiftool`.  It queries the active catalog directly and
+> writes `ln` shell commands to the Desktop.  This approach is simpler and could be
+> useful for other users, but **it does not work yet** and if it ever works
+> it will not have all the functionality of the Python script
+> (`relink_missing_photos.py`).
 
 ---
 
