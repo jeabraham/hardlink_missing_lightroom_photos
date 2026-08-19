@@ -4,6 +4,7 @@ import shlex
 import argparse
 import sys
 import subprocess
+import shutil
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,34 @@ TZ_MISMATCH_RESIDUAL = timedelta(minutes=1)  # allowed residual after removing t
 TZ_MISMATCH_MAX = timedelta(hours=26)         # max tz offset to consider
 RAW_EXTENSIONS = {".dng", ".orf", ".arw", ".cr2", ".nef", ".rw2", ".raf", ".pef"}
 IGNORED_CANDIDATE_EXTENSIONS = {".xmp"}
+
+
+def ensure_exiftool_available():
+    exiftool_path = shutil.which("exiftool")
+    if not exiftool_path:
+        print(
+            "❌ exiftool was not found in PATH. Install it before running this script "
+            "(for example: brew install exiftool).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        subprocess.run(
+            [exiftool_path, "-ver"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        print("❌ exiftool is installed but did not respond in time.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        detail = f" Details: {stderr}" if stderr else ""
+        print(f"❌ exiftool check failed.{detail}", file=sys.stderr)
+        sys.exit(1)
 
 def get_exif_data_exiftool(image_path, verbose_debug=False):
     if verbose_debug:
@@ -665,6 +694,9 @@ if __name__ == "__main__":
     # Validate: search-root required unless --mdfind
     if not args.mdfind and args.search_root is None:
         parser.error("--search-root is required unless --mdfind is specified.")
+
+    # Fail fast before expensive indexing if exiftool is unavailable.
+    ensure_exiftool_available()
 
     # Auto-enable debug for small test runs
     debug = args.debug or (args.test_n is not None and args.test_n < 20)

@@ -142,7 +142,8 @@ python3 recover_from_timemachine.py inspect /Volumes/iMacBackup3
 ```
 
 Walks the Time Machine volume and reports the layout type, host/computer names,
-available snapshots, and which snapshots contain a `Ladyhawke` volume directory.
+available snapshots, and which snapshots contain your source volume directory
+(for example, `Ladyhawke`).
 Read-only; modifies nothing.
 
 ### scan — find missing originals in Time Machine
@@ -150,11 +151,13 @@ Read-only; modifies nothing.
 ```bash
 python3 recover_from_timemachine.py scan \
     data/Missing_Photos.csv \
-    /Volumes/iMacBackup3
+    /Volumes/iMacBackup3 \
+    --source-volume /Volumes/Ladyhawke
 ```
 
 For each entry in the missing-photos CSV, derives the relative path under
-`/Volumes/Ladyhawke` and searches snapshots (newest first).
+the source volume passed to `--source-volume` (for example,
+`/Volumes/Ladyhawke`) and searches snapshots (newest first).
 
 Search strategies:
 
@@ -184,8 +187,8 @@ Each record is classified as one of:
 | `FOUND_IN_TIME_MACHINE` | Exactly one snapshot contains the file |
 | `MULTIPLE_TIME_MACHINE_VERSIONS` | Multiple snapshots match; newest is used |
 | `NOT_FOUND_IN_TIME_MACHINE` | File absent from all inspected snapshots |
-| `CURRENTLY_PRESENT` | File already exists on Ladyhawke — no recovery needed |
-| `NON_LADYHAWKE_PATH` | Expected path is on a different volume; out of scope here |
+| `CURRENTLY_PRESENT` | File already exists on the source volume — no recovery needed |
+| `NON_SOURCE_VOLUME_PATH` | Expected path is on a different volume; out of scope here |
 
 Writes `data/timemachine_recovery_candidates.csv` (columns: `status`,
 `expected_path`, `relative_path`, `backup_path`, `backup_date`, `file_size`,
